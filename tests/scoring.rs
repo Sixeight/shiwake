@@ -1,6 +1,6 @@
 use shiwake::{
-    AnalysisResult, AnalyzerPlugin, ChangedFile, Confidence, ReasonKind, RuleConfig, ScoreConfig,
-    analyze_patch, analyze_patch_with_config,
+    AnalysisContext, AnalyzerPlugin, Confidence, PluginAnalysis, PluginFinding, ReasonKind,
+    RuleConfig, ScoreConfig, analyze_patch, analyze_patch_with_config, plugins::go::GoPlugin,
 };
 
 fn single_file_patch(old_path: &str, new_path: &str, removed: &[&str], added: &[&str]) -> String {
@@ -32,17 +32,19 @@ impl AnalyzerPlugin for BonusPlugin {
         "bonus"
     }
 
-    fn supports(&self, file: &ChangedFile) -> bool {
-        file.path.ends_with(".rs")
-    }
+    fn analyze(&self, ctx: &AnalysisContext) -> PluginAnalysis {
+        let findings = ctx
+            .files
+            .iter()
+            .filter(|file| file.path.ends_with(".rs"))
+            .map(|file| PluginFinding {
+                path: file.path.clone(),
+                kind: ReasonKind::PluginSignal,
+                message: String::from("plugin bonus"),
+            })
+            .collect();
 
-    fn analyze(&self, file: &ChangedFile) -> AnalysisResult {
-        AnalysisResult::from_plugin(
-            file.path.clone(),
-            10,
-            Confidence::High,
-            vec![ReasonKind::PluginSignal.as_reason(file.path.clone(), 10, "plugin bonus")],
-        )
+        PluginAnalysis::new(Confidence::High, findings)
     }
 }
 
@@ -245,4 +247,57 @@ score = 70
     assert_eq!(config.rules.len(), 1);
     assert_eq!(config.rules[0].kind, ReasonKind::ControlFlowChange);
     assert_eq!(config.rules[0].score, 70);
+}
+
+#[test]
+fn go_plugin_adds_signal_for_select_statements() {
+    let patch = single_file_patch(
+        "internal/service.go",
+        "internal/service.go",
+        &["return run(ctx)"],
+        &[
+            "select {",
+            "case <-ctx.Done():",
+            "    return ctx.Err()",
+            "default:",
+            "    return run(ctx)",
+            "}",
+        ],
+    );
+
+    let plugin = GoPlugin::new();
+    let report = analyze_patch(&patch, &[&plugin]).expect("analysis should succeed");
+
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == ReasonKind::GoConcurrencyChange
+                && reason.message.contains("go select")),
+    );
+    assert_eq!(report.confidence.as_str(), "medium");
+    assert!(report.score >= 75, "score was {}", report.score);
+}
+
+#[test]
+fn go_plugin_adds_signal_for_exported_api_changes() {
+    let patch = single_file_patch(
+        "pkg/api.go",
+        "pkg/api.go",
+        &["func Build(ctx context.Context) error {"],
+        &["func Build(ctx context.Context, strict bool) error {"],
+    );
+
+    let plugin = GoPlugin::new();
+    let report = analyze_patch(&patch, &[&plugin]).expect("analysis should succeed");
+
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == ReasonKind::GoExportedApiChange
+                && reason.message.contains("exported go api")),
+    );
+    assert_eq!(report.confidence.as_str(), "medium");
+    assert!(report.score >= 85, "score was {}", report.score);
 }
