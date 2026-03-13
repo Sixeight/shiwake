@@ -63,9 +63,9 @@ skip_review_max = 10
 review_recommended_max = 30
 
 [aggregation]
-top_file_weight = 1.0
-secondary_file_weight = 0.33
 max_score = 100
+secondary_ratio = 0.2
+secondary_cap = 12
 
 [[rules]]
 kind = "comment_only"

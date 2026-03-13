@@ -3,6 +3,7 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,6 +11,7 @@ use git2::{Repository, Tree};
 use serde::{Deserialize, Serialize};
 
 const SCORING_MODEL_VERSION: &str = "v1";
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub mod plugins;
 
@@ -99,6 +101,8 @@ impl Confidence {
 pub enum ReasonKind {
     CommentOnly,
     ImportOnly,
+    ChangeSize,
+    RepoHotspot,
     RefactorLikeChange,
     PublicInterfaceChange,
     ControlFlowChange,
@@ -108,6 +112,11 @@ pub enum ReasonKind {
     GoExportedApiChange,
     GoInterfaceBreak,
     GoConcurrencyChange,
+    GoErrorHandlingChange,
+    GoReceiverChange,
+    GoTestOracleChange,
+    GoRuntimeBehaviorChange,
+    GoResourceLifecycleChange,
     GoAnalysisFallback,
 }
 
@@ -136,9 +145,9 @@ pub struct DecisionThresholds {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AggregationConfig {
-    pub top_file_weight: f64,
-    pub secondary_file_weight: f64,
     pub max_score: u32,
+    pub secondary_ratio: f64,
+    pub secondary_cap: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -160,9 +169,9 @@ impl ScoreConfig {
                 review_recommended_max: 59,
             },
             aggregation: AggregationConfig {
-                top_file_weight: 1.0,
-                secondary_file_weight: 0.33,
                 max_score: 100,
+                secondary_ratio: 0.2,
+                secondary_cap: 12,
             },
             rules: vec![
                 RuleConfig {
@@ -172,6 +181,14 @@ impl ScoreConfig {
                 RuleConfig {
                     kind: ReasonKind::ImportOnly,
                     score: 5,
+                },
+                RuleConfig {
+                    kind: ReasonKind::ChangeSize,
+                    score: 25,
+                },
+                RuleConfig {
+                    kind: ReasonKind::RepoHotspot,
+                    score: 15,
                 },
                 RuleConfig {
                     kind: ReasonKind::RefactorLikeChange,
@@ -208,6 +225,26 @@ impl ScoreConfig {
                 RuleConfig {
                     kind: ReasonKind::GoConcurrencyChange,
                     score: 20,
+                },
+                RuleConfig {
+                    kind: ReasonKind::GoErrorHandlingChange,
+                    score: 25,
+                },
+                RuleConfig {
+                    kind: ReasonKind::GoReceiverChange,
+                    score: 25,
+                },
+                RuleConfig {
+                    kind: ReasonKind::GoTestOracleChange,
+                    score: 30,
+                },
+                RuleConfig {
+                    kind: ReasonKind::GoRuntimeBehaviorChange,
+                    score: 25,
+                },
+                RuleConfig {
+                    kind: ReasonKind::GoResourceLifecycleChange,
+                    score: 25,
                 },
                 RuleConfig {
                     kind: ReasonKind::GoAnalysisFallback,
@@ -271,6 +308,13 @@ pub struct ChangedFile {
     pub removed: Vec<String>,
     pub before_source: Option<String>,
     pub after_source: Option<String>,
+    pub history: Option<FileHistory>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FileHistory {
+    pub prior_commits: usize,
+    pub prior_authors: usize,
 }
 
 impl ChangedFile {
@@ -320,6 +364,14 @@ pub struct PluginFinding {
     pub path: String,
     pub kind: ReasonKind,
     pub message: String,
+    pub weight_override: Option<u32>,
+    pub score_mode: PluginScoreMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginScoreMode {
+    Base,
+    Additive,
 }
 
 #[derive(Clone, Debug)]
@@ -347,6 +399,10 @@ pub struct FileScore {
     pub path: String,
     pub score: u32,
     pub language: String,
+    pub base_score: u32,
+    pub size_modifier: u32,
+    pub hotspot_modifier: u32,
+    pub plugin_contribution: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -355,6 +411,8 @@ pub struct FeatureVector {
     pub public_signature_changes: usize,
     pub control_flow_changes: usize,
     pub assertion_changes: usize,
+    pub size_signals: usize,
+    pub hotspot_signals: usize,
     pub plugin_signals: usize,
 }
 
@@ -365,9 +423,37 @@ pub struct ScoreReport {
     pub score: u32,
     pub decision: Decision,
     pub confidence: Confidence,
+    pub secondary_contribution: u32,
     pub reasons: Vec<Reason>,
     pub by_file: Vec<FileScore>,
     pub feature_vector: FeatureVector,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FileScoreState {
+    base_score: u32,
+    size_modifier: u32,
+    hotspot_modifier: u32,
+    plugin_contribution: u32,
+    score: u32,
+}
+
+impl FileScoreState {
+    fn recompute_score(&mut self, max_score: u32) {
+        self.score = self
+            .base_score
+            .saturating_add(self.size_modifier)
+            .saturating_add(self.hotspot_modifier)
+            .saturating_add(self.plugin_contribution)
+            .min(max_score);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BaseScoring {
+    base_score: u32,
+    has_semantic_risk: bool,
+    refactor_like: bool,
 }
 
 pub fn analyze_patch(
@@ -416,8 +502,10 @@ pub fn analyze_request_with_config(
     let mut file_scores = HashMap::new();
 
     for file in &ctx.files {
-        let score = score_file(file, &mut reasons, &mut feature_vector, config);
-        file_scores.insert(file.path.clone(), score);
+        file_scores.insert(
+            file.path.clone(),
+            score_file(file, &mut reasons, &mut feature_vector, config),
+        );
     }
 
     for plugin in plugins {
@@ -425,35 +513,19 @@ pub fn analyze_request_with_config(
         overall_confidence = min_confidence(&overall_confidence, &analysis.confidence);
 
         for finding in analysis.findings {
-            let weight = config.score_for(&finding.kind);
-            let score = file_scores.entry(finding.path.clone()).or_insert(0);
-            *score = score.saturating_add(weight);
-            feature_vector.plugin_signals += 1;
-            reasons.push(
-                finding
-                    .kind
-                    .as_reason(finding.path, weight, finding.message),
+            apply_plugin_finding(
+                finding,
+                &mut file_scores,
+                &mut reasons,
+                &mut feature_vector,
+                config,
             );
         }
     }
 
-    let mut by_file = Vec::with_capacity(ctx.files.len());
-    let mut aggregate_inputs = Vec::with_capacity(ctx.files.len());
-    for file in &ctx.files {
-        let file_score = file_scores
-            .get(&file.path)
-            .copied()
-            .unwrap_or_default()
-            .min(config.aggregation.max_score);
-        aggregate_inputs.push(file_score);
-        by_file.push(FileScore {
-            path: file.path.clone(),
-            score: file_score,
-            language: file.language().to_string(),
-        });
-    }
+    let (by_file, aggregate_inputs) = collect_file_scores(&ctx.files, &file_scores);
 
-    let score = aggregate_scores(&aggregate_inputs, &config.aggregation);
+    let (score, secondary_contribution) = aggregate_scores(&aggregate_inputs, &config.aggregation);
 
     Ok(ScoreReport {
         schema_version: config.schema_version.to_string(),
@@ -461,6 +533,7 @@ pub fn analyze_request_with_config(
         score,
         decision: score_to_decision(score, &config.decision_thresholds),
         confidence: overall_confidence,
+        secondary_contribution,
         reasons,
         by_file,
         feature_vector,
@@ -526,6 +599,7 @@ fn build_git_revision_context(
     for file in &mut files {
         file.before_source = read_blob_text(&repo, &base_tree, file.old_path.as_deref())?;
         file.after_source = read_blob_text(&repo, &head_tree, file.new_path.as_deref())?;
+        file.history = Some(read_file_history(repo_root, base, &file.path)?);
     }
 
     let before_workspace = unique_temp_dir("go-before");
@@ -601,7 +675,11 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time should move forward")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("shiwake-{prefix}-{nanos}"));
+    let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "shiwake-{prefix}-{}-{nanos}-{counter}",
+        std::process::id()
+    ));
     fs::create_dir_all(&path).expect("temp directory should be created");
     path
 }
@@ -640,30 +718,118 @@ fn export_tree(repo: &Repository, tree: &Tree<'_>, dest: &Path) -> Result<(), An
     Ok(())
 }
 
+fn apply_plugin_finding(
+    finding: PluginFinding,
+    file_scores: &mut HashMap<String, FileScoreState>,
+    reasons: &mut Vec<Reason>,
+    feature_vector: &mut FeatureVector,
+    config: &ScoreConfig,
+) {
+    let weight = finding
+        .weight_override
+        .unwrap_or_else(|| config.score_for(&finding.kind));
+    let score = file_scores
+        .entry(finding.path.clone())
+        .or_insert_with(FileScoreState::default);
+
+    match finding.score_mode {
+        PluginScoreMode::Base => {
+            score.base_score = score.base_score.max(weight);
+        }
+        PluginScoreMode::Additive => {
+            score.plugin_contribution = score.plugin_contribution.saturating_add(weight);
+        }
+    }
+    score.recompute_score(config.aggregation.max_score);
+
+    feature_vector.plugin_signals += 1;
+    reasons.push(finding.kind.as_reason(finding.path, weight, finding.message));
+}
+
+fn collect_file_scores(
+    files: &[ChangedFile],
+    file_scores: &HashMap<String, FileScoreState>,
+) -> (Vec<FileScore>, Vec<FileScoreState>) {
+    let mut by_file = Vec::with_capacity(files.len());
+    let mut aggregate_inputs = Vec::with_capacity(files.len());
+
+    for file in files {
+        let file_score = file_scores
+            .get(&file.path)
+            .cloned()
+            .unwrap_or_else(FileScoreState::default);
+        aggregate_inputs.push(file_score.clone());
+        by_file.push(FileScore {
+            path: file.path.clone(),
+            score: file_score.score,
+            language: file.language().to_string(),
+            base_score: file_score.base_score,
+            size_modifier: file_score.size_modifier,
+            hotspot_modifier: file_score.hotspot_modifier,
+            plugin_contribution: file_score.plugin_contribution,
+        });
+    }
+
+    (by_file, aggregate_inputs)
+}
+
 fn score_file(
     file: &ChangedFile,
     reasons: &mut Vec<Reason>,
     feature_vector: &mut FeatureVector,
     config: &ScoreConfig,
-) -> u32 {
+) -> FileScoreState {
     if changed_lines(file)
         .iter()
         .all(|line| is_comment_or_blank(line))
     {
-        let score = config.score_for(&ReasonKind::CommentOnly);
-        reasons.push(ReasonKind::CommentOnly.as_reason(
-            file.path.clone(),
-            score,
-            "comment or whitespace only change",
-        ));
-        return score;
+        return comment_only_score(file, reasons, config);
     }
 
-    let mut score = 0;
+    let base = detect_base_scoring(file, reasons, feature_vector, config);
+    let (size_modifier, hotspot_modifier) =
+        compute_modifiers(file, &base, reasons, feature_vector, config);
+    let score = (base.base_score + size_modifier + hotspot_modifier).min(config.aggregation.max_score);
+
+    FileScoreState {
+        base_score: base.base_score,
+        size_modifier,
+        hotspot_modifier,
+        plugin_contribution: 0,
+        score,
+    }
+}
+
+fn comment_only_score(file: &ChangedFile, reasons: &mut Vec<Reason>, config: &ScoreConfig) -> FileScoreState {
+    let score = config.score_for(&ReasonKind::CommentOnly);
+    reasons.push(ReasonKind::CommentOnly.as_reason(
+        file.path.clone(),
+        score,
+        "comment or whitespace only change",
+    ));
+
+    FileScoreState {
+        base_score: score,
+        size_modifier: 0,
+        hotspot_modifier: 0,
+        plugin_contribution: 0,
+        score,
+    }
+}
+
+fn detect_base_scoring(
+    file: &ChangedFile,
+    reasons: &mut Vec<Reason>,
+    feature_vector: &mut FeatureVector,
+    config: &ScoreConfig,
+) -> BaseScoring {
+    let refactor_like = is_refactor_like(file);
+    let mut base_score = 0;
+    let mut has_semantic_risk = false;
 
     if is_import_only(file) {
         let rule_score = config.score_for(&ReasonKind::ImportOnly);
-        score = score.max(rule_score);
+        base_score = base_score.max(rule_score);
         reasons.push(ReasonKind::ImportOnly.as_reason(
             file.path.clone(),
             rule_score,
@@ -671,9 +837,10 @@ fn score_file(
         ));
     }
 
-    if has_public_interface_change(file) {
+    if !file.is_test_file() && has_public_interface_change(file) {
         let rule_score = config.score_for(&ReasonKind::PublicInterfaceChange);
-        score = score.max(rule_score);
+        base_score = base_score.max(rule_score);
+        has_semantic_risk = true;
         feature_vector.public_signature_changes += 1;
         reasons.push(ReasonKind::PublicInterfaceChange.as_reason(
             file.path.clone(),
@@ -682,9 +849,14 @@ fn score_file(
         ));
     }
 
-    if has_control_flow_change(file) {
-        let rule_score = config.score_for(&ReasonKind::ControlFlowChange);
-        score = score.max(rule_score);
+    if let Some(control_flow_score) = control_flow_weight(file, config) {
+        let rule_score = if file.is_test_file() {
+            control_flow_score.min(20)
+        } else {
+            control_flow_score
+        };
+        base_score = base_score.max(rule_score);
+        has_semantic_risk = true;
         feature_vector.control_flow_changes += 1;
         reasons.push(ReasonKind::ControlFlowChange.as_reason(
             file.path.clone(),
@@ -695,7 +867,8 @@ fn score_file(
 
     if file.is_test_file() && has_test_expectation_change(file) {
         let rule_score = config.score_for(&ReasonKind::TestExpectationChange);
-        score = score.max(rule_score);
+        base_score = base_score.max(rule_score);
+        has_semantic_risk = true;
         feature_vector.assertion_changes += 1;
         reasons.push(ReasonKind::TestExpectationChange.as_reason(
             file.path.clone(),
@@ -704,41 +877,131 @@ fn score_file(
         ));
     }
 
-    if score == 0 && is_refactor_like(file) {
-        score = config.score_for(&ReasonKind::RefactorLikeChange);
+    if base_score == 0 && refactor_like {
+        base_score = config.score_for(&ReasonKind::RefactorLikeChange);
         reasons.push(ReasonKind::RefactorLikeChange.as_reason(
             file.path.clone(),
-            score,
+            base_score,
             "refactor-like change",
         ));
     }
 
-    if score == 0 {
-        score = config.score_for(&ReasonKind::GenericCodeChange);
+    if base_score == 0 {
+        base_score = config.score_for(&ReasonKind::GenericCodeChange);
         reasons.push(ReasonKind::GenericCodeChange.as_reason(
             file.path.clone(),
-            score,
+            base_score,
             "generic code change",
         ));
     }
 
-    score
+    BaseScoring {
+        base_score,
+        has_semantic_risk,
+        refactor_like,
+    }
 }
 
-fn aggregate_scores(scores: &[u32], config: &AggregationConfig) -> u32 {
-    let mut sorted = scores.to_vec();
-    sorted.sort_unstable_by(|left, right| right.cmp(left));
+fn compute_modifiers(
+    file: &ChangedFile,
+    base: &BaseScoring,
+    reasons: &mut Vec<Reason>,
+    feature_vector: &mut FeatureVector,
+    config: &ScoreConfig,
+) -> (u32, u32) {
+    let modifier_cap = modifier_cap(base.base_score);
+    let size_modifier = compute_size_modifier(file, base, modifier_cap, reasons, feature_vector, config);
+    let hotspot_modifier =
+        compute_hotspot_modifier(file, base, modifier_cap, size_modifier, reasons, feature_vector, config);
 
-    let mut total = 0.0;
-    for (index, score) in sorted.iter().enumerate() {
-        if index == 0 {
-            total += (*score as f64) * config.top_file_weight;
-        } else {
-            total += (*score as f64) * config.secondary_file_weight;
-        }
+    (size_modifier, hotspot_modifier)
+}
+
+fn compute_size_modifier(
+    file: &ChangedFile,
+    base: &BaseScoring,
+    modifier_cap: u32,
+    reasons: &mut Vec<Reason>,
+    feature_vector: &mut FeatureVector,
+    config: &ScoreConfig,
+) -> u32 {
+    if base.refactor_like {
+        return 0;
     }
 
-    total.round().clamp(0.0, config.max_score as f64) as u32
+    let Some(rule_score) = change_size_weight(file, config) else {
+        return 0;
+    };
+    let size_modifier = rule_score.min(modifier_cap);
+    if size_modifier == 0 {
+        return 0;
+    }
+
+    feature_vector.size_signals += 1;
+    reasons.push(ReasonKind::ChangeSize.as_reason(
+        file.path.clone(),
+        size_modifier,
+        format!("change size increased review load ({} changed lines)", change_volume(file)),
+    ));
+
+    size_modifier
+}
+
+fn compute_hotspot_modifier(
+    file: &ChangedFile,
+    base: &BaseScoring,
+    modifier_cap: u32,
+    size_modifier: u32,
+    reasons: &mut Vec<Reason>,
+    feature_vector: &mut FeatureVector,
+    config: &ScoreConfig,
+) -> u32 {
+    if base.refactor_like || !base.has_semantic_risk {
+        return 0;
+    }
+
+    let Some(rule_score) = repo_hotspot_weight(file, config) else {
+        return 0;
+    };
+    let hotspot_modifier = rule_score.min(modifier_cap.saturating_sub(size_modifier));
+    if hotspot_modifier == 0 {
+        return 0;
+    }
+
+    feature_vector.hotspot_signals += 1;
+    let history = file.history.as_ref().expect("history should exist");
+    reasons.push(ReasonKind::RepoHotspot.as_reason(
+        file.path.clone(),
+        hotspot_modifier,
+        format!(
+            "repo hotspot with {} prior commits across {} authors",
+            history.prior_commits, history.prior_authors
+        ),
+    ));
+
+    hotspot_modifier
+}
+
+fn aggregate_scores(scores: &[FileScoreState], config: &AggregationConfig) -> (u32, u32) {
+    let mut sorted = scores.to_vec();
+    sorted.sort_unstable_by(|left, right| right.score.cmp(&left.score));
+
+    let top_score = sorted.first().map(|file| file.score).unwrap_or_default();
+    let secondary_raw: u32 = sorted
+        .iter()
+        .skip(1)
+        .map(|file| file.score.min(30))
+        .sum();
+    let secondary_contribution = ((secondary_raw as f64) * config.secondary_ratio)
+        .round()
+        .min(config.secondary_cap as f64) as u32;
+
+    (
+        top_score
+            .saturating_add(secondary_contribution)
+            .min(config.max_score),
+        secondary_contribution,
+    )
 }
 
 fn score_to_decision(score: u32, config: &DecisionThresholds) -> Decision {
@@ -784,6 +1047,7 @@ fn parse_patch(patch: &str) -> Result<Vec<ChangedFile>, AnalyzeError> {
                 removed: Vec::new(),
                 before_source: None,
                 after_source: None,
+                history: None,
             });
             continue;
         }
@@ -855,6 +1119,38 @@ fn normalize_diff_path(path: &str) -> Option<String> {
     Some(strip_diff_prefix(path))
 }
 
+fn read_file_history(repo_root: &Path, base: &str, path: &str) -> Result<FileHistory, AnalyzeError> {
+    let commit_count = git_stdout(repo_root, &["rev-list", "--count", base, "--", path])?;
+    let author_log = git_stdout(repo_root, &["log", "--format=%an", base, "--", path])?;
+    let prior_authors = author_log
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
+    Ok(FileHistory {
+        prior_commits: commit_count.trim().parse().unwrap_or_default(),
+        prior_authors,
+    })
+}
+
+fn git_stdout(repo_root: &Path, args: &[&str]) -> Result<String, AnalyzeError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(AnalyzeError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+
+    Ok(String::from_utf8(output.stdout)?)
+}
+
 fn changed_lines(file: &ChangedFile) -> Vec<&str> {
     file.added
         .iter()
@@ -912,15 +1208,81 @@ fn is_public_signature_line(line: &str) -> bool {
     false
 }
 
-fn has_control_flow_change(file: &ChangedFile) -> bool {
-    changed_lines(file).iter().any(|line| {
+fn control_flow_weight(file: &ChangedFile, config: &ScoreConfig) -> Option<u32> {
+    let has_control_flow = changed_lines(file).iter().any(|line| {
         let trimmed = line.trim();
         [
             "if ", "if(", "else if", "match ", "switch ", "for ", "while ", "return ", "throw ",
         ]
         .iter()
         .any(|keyword| trimmed.starts_with(keyword))
-    })
+    });
+    if !has_control_flow {
+        return None;
+    }
+
+    let base_weight = config.score_for(&ReasonKind::ControlFlowChange);
+    let is_heavy = changed_lines(file).iter().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "return"
+            || trimmed.starts_with("return ")
+            || trimmed.starts_with("throw ")
+            || trimmed.starts_with("for ")
+            || trimmed.starts_with("while ")
+            || trimmed.starts_with("match ")
+            || trimmed.starts_with("switch ")
+    });
+
+    if is_heavy {
+        return Some(base_weight);
+    }
+
+    let nesting_bonus = match approximate_branch_nesting_depth(file) {
+        depth if depth >= 3 => 15,
+        2 => 10,
+        _ => 0,
+    };
+
+    Some((base_weight.min(30) + nesting_bonus).min(base_weight))
+}
+
+fn approximate_branch_nesting_depth(file: &ChangedFile) -> usize {
+    let mut current_depth = 0usize;
+    let mut max_depth = 0usize;
+
+    for line in &file.added {
+        let trimmed = line.trim();
+
+        let closing_braces = trimmed.chars().filter(|ch| *ch == '}').count();
+        current_depth = current_depth.saturating_sub(closing_braces);
+
+        if starts_branch(trimmed) {
+            let branch_depth = current_depth + 1;
+            max_depth = max_depth.max(branch_depth);
+        }
+
+        let opening_braces = trimmed.chars().filter(|ch| *ch == '{').count();
+        current_depth += opening_braces;
+    }
+
+    max_depth
+}
+
+fn starts_branch(trimmed: &str) -> bool {
+    [
+        "if ",
+        "if(",
+        "else if",
+        "match ",
+        "switch ",
+        "for ",
+        "while ",
+        "select ",
+        "select{",
+        "select {",
+    ]
+    .iter()
+    .any(|keyword| trimmed.starts_with(keyword))
 }
 
 fn has_test_expectation_change(file: &ChangedFile) -> bool {
@@ -945,6 +1307,70 @@ fn is_refactor_like(file: &ChangedFile) -> bool {
     added.sort_unstable();
 
     removed == added
+}
+
+fn change_volume(file: &ChangedFile) -> usize {
+    file.added.len() + file.removed.len()
+}
+
+fn modifier_cap(base_score: u32) -> u32 {
+    match base_score {
+        0..=10 => 0,
+        11..=29 => 8,
+        30..=54 => 12,
+        _ => 18,
+    }
+}
+
+fn change_size_weight(file: &ChangedFile, config: &ScoreConfig) -> Option<u32> {
+    if config.score_for(&ReasonKind::ChangeSize) == 0 {
+        return None;
+    }
+
+    let changed_lines = change_volume(file);
+    let changed_ratio = file
+        .after_source
+        .as_deref()
+        .or(file.before_source.as_deref())
+        .map(|source| changed_lines as f64 / source.lines().count().max(1) as f64);
+
+    let mut score: u32 = if changed_lines >= 25 || changed_ratio.is_some_and(|ratio| ratio >= 0.6)
+    {
+        12
+    } else if changed_lines >= 10 || changed_ratio.is_some_and(|ratio| ratio >= 0.3) {
+        8
+    } else if changed_lines >= 4 {
+        4
+    } else {
+        0
+    };
+
+    if file.is_test_file() {
+        score = (score + 1) / 2;
+    }
+
+    (score > 0).then_some(score)
+}
+
+fn repo_hotspot_weight(file: &ChangedFile, config: &ScoreConfig) -> Option<u32> {
+    let history = file.history.as_ref()?;
+    if config.score_for(&ReasonKind::RepoHotspot) == 0 {
+        return None;
+    }
+
+    let mut score = if history.prior_commits >= 10 {
+        8
+    } else if history.prior_commits >= 4 {
+        4
+    } else {
+        0
+    };
+
+    if file.is_test_file() {
+        score = score.min(3);
+    }
+
+    (score > 0).then_some(score)
 }
 
 fn normalized_code_lines(lines: &[String]) -> Vec<String> {

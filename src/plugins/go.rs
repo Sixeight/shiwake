@@ -4,6 +4,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,11 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AnalysisContext, AnalyzerPlugin, Confidence, InputKind, PluginAnalysis, PluginFinding,
-    ReasonKind,
+    PluginScoreMode, ReasonKind,
 };
 
 const HELPER_GO_MOD: &str = include_str!("../../tools/go-analyzer/go.mod");
+const HELPER_GO_SUM: &str = include_str!("../../tools/go-analyzer/go.sum");
 const HELPER_MAIN_GO: &str = include_str!("../../tools/go-analyzer/main.go");
+static HELPER_TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct GoPlugin;
 
@@ -92,6 +95,8 @@ impl AnalyzerPlugin for GoPlugin {
                     path: path.clone(),
                     kind: ReasonKind::GoExportedApiChange,
                     message: String::from("go exported api changed"),
+                    weight_override: None,
+                    score_mode: PluginScoreMode::Base,
                 });
             }
 
@@ -118,6 +123,8 @@ impl AnalyzerPlugin for GoPlugin {
                         "go interface implementation removed: {}",
                         removed.join(", ")
                     ),
+                    weight_override: None,
+                    score_mode: PluginScoreMode::Base,
                 });
             }
         }
@@ -125,11 +132,69 @@ impl AnalyzerPlugin for GoPlugin {
         for path in &go_files {
             let before_file = before.files.get(path);
             let after_file = after.files.get(path);
+            if receiver_changed(before_file, after_file) {
+                findings.push(PluginFinding {
+                    path: path.clone(),
+                    kind: ReasonKind::GoReceiverChange,
+                    message: String::from("go receiver kind changed"),
+                    weight_override: None,
+                    score_mode: PluginScoreMode::Base,
+                });
+            }
             if concurrency_changed(before_file, after_file) {
                 findings.push(PluginFinding {
                     path: path.clone(),
                     kind: ReasonKind::GoConcurrencyChange,
-                    message: String::from("go concurrency primitive changed"),
+                    message: format!(
+                        "go concurrency primitive changed (nesting {})",
+                        concurrency_nesting(after_file)
+                    ),
+                    weight_override: Some(go_concurrency_weight(after_file)),
+                    score_mode: PluginScoreMode::Base,
+                });
+            }
+
+            if error_handling_changed(before_file, after_file) {
+                findings.push(PluginFinding {
+                    path: path.clone(),
+                    kind: ReasonKind::GoErrorHandlingChange,
+                    message: String::from("go error handling changed"),
+                    weight_override: None,
+                    score_mode: PluginScoreMode::Base,
+                });
+            }
+
+            if runtime_behavior_changed(before_file, after_file) {
+                findings.push(PluginFinding {
+                    path: path.clone(),
+                    kind: ReasonKind::GoRuntimeBehaviorChange,
+                    message: String::from("go runtime behavior changed"),
+                    weight_override: None,
+                    score_mode: PluginScoreMode::Base,
+                });
+            }
+            if resource_lifecycle_changed(before_file, after_file) {
+                findings.push(PluginFinding {
+                    path: path.clone(),
+                    kind: ReasonKind::GoResourceLifecycleChange,
+                    message: String::from("go resource lifecycle changed"),
+                    weight_override: None,
+                    score_mode: PluginScoreMode::Base,
+                });
+            }
+        }
+
+        for file in &ctx.files {
+            if !file.path.ends_with("_test.go") {
+                continue;
+            }
+            if go_test_oracle_changed(file) {
+                findings.push(PluginFinding {
+                    path: file.path.clone(),
+                    kind: ReasonKind::GoTestOracleChange,
+                    message: String::from("go test oracle changed"),
+                    weight_override: None,
+                    score_mode: PluginScoreMode::Base,
                 });
             }
         }
@@ -158,6 +223,8 @@ fn fallback_findings(ctx: &AnalysisContext, reason: &str) -> PluginAnalysis {
             path: file.path.clone(),
             kind: ReasonKind::GoAnalysisFallback,
             message: reason.to_string(),
+            weight_override: None,
+            score_mode: PluginScoreMode::Additive,
         });
 
         if file
@@ -170,6 +237,8 @@ fn fallback_findings(ctx: &AnalysisContext, reason: &str) -> PluginAnalysis {
                 path: file.path.clone(),
                 kind: ReasonKind::GoConcurrencyChange,
                 message: String::from("go select change"),
+                weight_override: Some(fallback_concurrency_weight(file)),
+                score_mode: PluginScoreMode::Base,
             });
         }
 
@@ -183,6 +252,8 @@ fn fallback_findings(ctx: &AnalysisContext, reason: &str) -> PluginAnalysis {
                 path: file.path.clone(),
                 kind: ReasonKind::GoExportedApiChange,
                 message: String::from("exported go api change"),
+                weight_override: None,
+                score_mode: PluginScoreMode::Base,
             });
         }
     }
@@ -218,6 +289,16 @@ struct HelperFileSnapshot {
     sends: u32,
     receives: u32,
     closes: u32,
+    max_nesting: u32,
+    errors_is_as_calls: u32,
+    nil_checks: u32,
+    panic_calls: u32,
+    recover_calls: u32,
+    context_checks: u32,
+    time_calls: u32,
+    retry_markers: u32,
+    receiver_kinds: HashMap<String, String>,
+    cleanup_calls: u32,
 }
 
 struct Snapshot {
@@ -228,6 +309,7 @@ struct Snapshot {
 fn run_helper(workspace_root: &Path, changed_files: &[String]) -> Result<Snapshot, String> {
     let helper_dir = unique_temp_dir("go-helper");
     fs::write(helper_dir.join("go.mod"), HELPER_GO_MOD).map_err(|error| error.to_string())?;
+    fs::write(helper_dir.join("go.sum"), HELPER_GO_SUM).map_err(|error| error.to_string())?;
     fs::write(helper_dir.join("main.go"), HELPER_MAIN_GO).map_err(|error| error.to_string())?;
 
     let request = HelperRequest {
@@ -283,7 +365,11 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time should move forward")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("shiwake-{prefix}-{nanos}"));
+    let counter = HELPER_TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "shiwake-{prefix}-{}-{nanos}-{counter}",
+        std::process::id()
+    ));
     fs::create_dir_all(&path).expect("temp helper dir should be created");
     path
 }
@@ -300,6 +386,16 @@ fn concurrency_changed(
         sends: 0,
         receives: 0,
         closes: 0,
+        max_nesting: 0,
+        errors_is_as_calls: 0,
+        nil_checks: 0,
+        panic_calls: 0,
+        recover_calls: 0,
+        context_checks: 0,
+        time_calls: 0,
+        retry_markers: 0,
+        receiver_kinds: HashMap::new(),
+        cleanup_calls: 0,
     });
     let after = after.cloned().unwrap_or(HelperFileSnapshot {
         path: String::new(),
@@ -309,7 +405,20 @@ fn concurrency_changed(
         sends: 0,
         receives: 0,
         closes: 0,
+        max_nesting: 0,
+        errors_is_as_calls: 0,
+        nil_checks: 0,
+        panic_calls: 0,
+        recover_calls: 0,
+        context_checks: 0,
+        time_calls: 0,
+        retry_markers: 0,
+        receiver_kinds: HashMap::new(),
+        cleanup_calls: 0,
     });
+
+    let before_has_concurrency = has_concurrency_primitives(&before);
+    let after_has_concurrency = has_concurrency_primitives(&after);
 
     before.goroutines != after.goroutines
         || before.defers != after.defers
@@ -317,6 +426,240 @@ fn concurrency_changed(
         || before.sends != after.sends
         || before.receives != after.receives
         || before.closes != after.closes
+        || ((before_has_concurrency || after_has_concurrency)
+            && before.max_nesting != after.max_nesting)
+}
+
+fn receiver_changed(before: Option<&HelperFileSnapshot>, after: Option<&HelperFileSnapshot>) -> bool {
+    let before = before.map(|value| &value.receiver_kinds);
+    let after = after.map(|value| &value.receiver_kinds);
+    before != after
+}
+
+fn concurrency_nesting(snapshot: Option<&HelperFileSnapshot>) -> u32 {
+    snapshot.map(|value| value.max_nesting).unwrap_or_default()
+}
+
+fn has_concurrency_primitives(snapshot: &HelperFileSnapshot) -> bool {
+    snapshot.goroutines > 0
+        || snapshot.defers > 0
+        || snapshot.selects > 0
+        || snapshot.sends > 0
+        || snapshot.receives > 0
+        || snapshot.closes > 0
+}
+
+fn error_handling_changed(
+    before: Option<&HelperFileSnapshot>,
+    after: Option<&HelperFileSnapshot>,
+) -> bool {
+    let before = before.cloned().unwrap_or(HelperFileSnapshot {
+        path: String::new(),
+        goroutines: 0,
+        defers: 0,
+        selects: 0,
+        sends: 0,
+        receives: 0,
+        closes: 0,
+        max_nesting: 0,
+        errors_is_as_calls: 0,
+        nil_checks: 0,
+        panic_calls: 0,
+        recover_calls: 0,
+        context_checks: 0,
+        time_calls: 0,
+        retry_markers: 0,
+        receiver_kinds: HashMap::new(),
+        cleanup_calls: 0,
+    });
+    let after = after.cloned().unwrap_or(HelperFileSnapshot {
+        path: String::new(),
+        goroutines: 0,
+        defers: 0,
+        selects: 0,
+        sends: 0,
+        receives: 0,
+        closes: 0,
+        max_nesting: 0,
+        errors_is_as_calls: 0,
+        nil_checks: 0,
+        panic_calls: 0,
+        recover_calls: 0,
+        context_checks: 0,
+        time_calls: 0,
+        retry_markers: 0,
+        receiver_kinds: HashMap::new(),
+        cleanup_calls: 0,
+    });
+
+    before.errors_is_as_calls != after.errors_is_as_calls
+        || before.nil_checks != after.nil_checks
+        || before.panic_calls != after.panic_calls
+        || before.recover_calls != after.recover_calls
+        || before.context_checks != after.context_checks
+}
+
+fn runtime_behavior_changed(
+    before: Option<&HelperFileSnapshot>,
+    after: Option<&HelperFileSnapshot>,
+) -> bool {
+    let before = before.cloned().unwrap_or(HelperFileSnapshot {
+        path: String::new(),
+        goroutines: 0,
+        defers: 0,
+        selects: 0,
+        sends: 0,
+        receives: 0,
+        closes: 0,
+        max_nesting: 0,
+        errors_is_as_calls: 0,
+        nil_checks: 0,
+        panic_calls: 0,
+        recover_calls: 0,
+        context_checks: 0,
+        time_calls: 0,
+        retry_markers: 0,
+        receiver_kinds: HashMap::new(),
+        cleanup_calls: 0,
+    });
+    let after = after.cloned().unwrap_or(HelperFileSnapshot {
+        path: String::new(),
+        goroutines: 0,
+        defers: 0,
+        selects: 0,
+        sends: 0,
+        receives: 0,
+        closes: 0,
+        max_nesting: 0,
+        errors_is_as_calls: 0,
+        nil_checks: 0,
+        panic_calls: 0,
+        recover_calls: 0,
+        context_checks: 0,
+        time_calls: 0,
+        retry_markers: 0,
+        receiver_kinds: HashMap::new(),
+        cleanup_calls: 0,
+    });
+
+    before.time_calls != after.time_calls || before.retry_markers != after.retry_markers
+}
+
+fn resource_lifecycle_changed(
+    before: Option<&HelperFileSnapshot>,
+    after: Option<&HelperFileSnapshot>,
+) -> bool {
+    let before = before.cloned().unwrap_or(HelperFileSnapshot {
+        path: String::new(),
+        goroutines: 0,
+        defers: 0,
+        selects: 0,
+        sends: 0,
+        receives: 0,
+        closes: 0,
+        max_nesting: 0,
+        errors_is_as_calls: 0,
+        nil_checks: 0,
+        panic_calls: 0,
+        recover_calls: 0,
+        context_checks: 0,
+        time_calls: 0,
+        retry_markers: 0,
+        receiver_kinds: HashMap::new(),
+        cleanup_calls: 0,
+    });
+    let after = after.cloned().unwrap_or(HelperFileSnapshot {
+        path: String::new(),
+        goroutines: 0,
+        defers: 0,
+        selects: 0,
+        sends: 0,
+        receives: 0,
+        closes: 0,
+        max_nesting: 0,
+        errors_is_as_calls: 0,
+        nil_checks: 0,
+        panic_calls: 0,
+        recover_calls: 0,
+        context_checks: 0,
+        time_calls: 0,
+        retry_markers: 0,
+        receiver_kinds: HashMap::new(),
+        cleanup_calls: 0,
+    });
+
+    before.cleanup_calls != after.cleanup_calls
+}
+
+fn go_test_oracle_changed(file: &crate::ChangedFile) -> bool {
+    if !file.is_test_file() {
+        return false;
+    }
+
+    file.added.iter().chain(file.removed.iter()).any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains("cmp.Diff(")
+            || trimmed.contains("assert.")
+            || trimmed.contains("require.")
+            || trimmed.contains("t.Fatal(")
+            || trimmed.contains("t.Fatalf(")
+            || trimmed.contains("t.Error(")
+            || trimmed.contains("t.Errorf(")
+    })
+}
+
+fn go_concurrency_weight(snapshot: Option<&HelperFileSnapshot>) -> u32 {
+    match concurrency_nesting(snapshot) {
+        depth if depth >= 4 => 35,
+        3 => 30,
+        2 => 25,
+        _ => 20,
+    }
+}
+
+fn fallback_concurrency_weight(file: &crate::ChangedFile) -> u32 {
+    match approximate_go_branch_nesting(file) {
+        depth if depth >= 4 => 35,
+        3 => 30,
+        2 => 25,
+        _ => 20,
+    }
+}
+
+fn approximate_go_branch_nesting(file: &crate::ChangedFile) -> usize {
+    let mut current_depth = 0usize;
+    let mut max_depth = 0usize;
+
+    for line in &file.added {
+        let trimmed = line.trim();
+
+        let closing_braces = trimmed.chars().filter(|ch| *ch == '}').count();
+        current_depth = current_depth.saturating_sub(closing_braces);
+
+        if starts_go_branch(trimmed) {
+            max_depth = max_depth.max(current_depth + 1);
+        }
+
+        let opening_braces = trimmed.chars().filter(|ch| *ch == '{').count();
+        current_depth += opening_braces;
+    }
+
+    max_depth
+}
+
+fn starts_go_branch(trimmed: &str) -> bool {
+    [
+        "if ",
+        "if(",
+        "else if",
+        "for ",
+        "switch ",
+        "select ",
+        "select{",
+        "select {",
+    ]
+    .iter()
+    .any(|keyword| trimmed.starts_with(keyword))
 }
 
 fn is_exported_go_declaration(line: &str) -> bool {

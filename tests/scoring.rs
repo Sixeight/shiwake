@@ -1,6 +1,14 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use shiwake::{
-    AnalysisContext, AnalyzerPlugin, Confidence, PluginAnalysis, PluginFinding, ReasonKind,
-    RuleConfig, ScoreConfig, analyze_patch, analyze_patch_with_config, plugins::go::GoPlugin,
+    AnalysisContext, AnalyzeInput, AnalyzeRequest, AnalyzerPlugin, Confidence, PluginAnalysis,
+    PluginFinding, PluginScoreMode, ReasonKind, RuleConfig, ScoreConfig, analyze_patch,
+    analyze_patch_with_config, analyze_request, plugins::go::GoPlugin,
 };
 
 fn single_file_patch(old_path: &str, new_path: &str, removed: &[&str], added: &[&str]) -> String {
@@ -25,6 +33,43 @@ fn single_file_patch(old_path: &str, new_path: &str, removed: &[&str], added: &[
     patch
 }
 
+fn unique_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+
+    std::env::temp_dir().join(format!("shiwake-{name}-{nanos}"))
+}
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = ProcessCommand::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .expect("git should run");
+
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    String::from_utf8(output.stdout)
+        .expect("git stdout should be utf8")
+        .trim()
+        .to_string()
+}
+
+fn write_file(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("parent should exist");
+    }
+
+    fs::write(path, contents).expect("file should be written");
+}
+
 struct BonusPlugin;
 
 impl AnalyzerPlugin for BonusPlugin {
@@ -41,6 +86,8 @@ impl AnalyzerPlugin for BonusPlugin {
                 path: file.path.clone(),
                 kind: ReasonKind::PluginSignal,
                 message: String::from("plugin bonus"),
+                weight_override: None,
+                score_mode: PluginScoreMode::Additive,
             })
             .collect();
 
@@ -134,6 +181,319 @@ fn rename_like_change_stays_low() {
 }
 
 #[test]
+fn larger_patch_scores_higher_than_small_patch() {
+    let small_patch = single_file_patch(
+        "src/lib.rs",
+        "src/lib.rs",
+        &["let status = old_status;"],
+        &["let status = new_status;"],
+    );
+    let large_patch = single_file_patch(
+        "src/lib.rs",
+        "src/lib.rs",
+        &["let status = old_status;"],
+        &[
+            "let first = compute_first();",
+            "let second = compute_second();",
+            "let third = compute_third();",
+            "let fourth = compute_fourth();",
+            "let fifth = compute_fifth();",
+            "let sixth = compute_sixth();",
+            "let seventh = compute_seventh();",
+            "let eighth = compute_eighth();",
+            "let ninth = compute_ninth();",
+            "let tenth = compute_tenth();",
+            "let eleventh = compute_eleventh();",
+            "let twelfth = compute_twelfth();",
+        ],
+    );
+
+    let small_report = analyze_patch(&small_patch, &[]).expect("analysis should succeed");
+    let large_report = analyze_patch(&large_patch, &[]).expect("analysis should succeed");
+
+    assert!(
+        large_report.score > small_report.score,
+        "small={}, large={}",
+        small_report.score,
+        large_report.score
+    );
+    assert!(
+        large_report
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == ReasonKind::ChangeSize)
+    );
+}
+
+#[test]
+fn revision_range_adds_repo_hotspot_signal_for_frequently_touched_file() {
+    let repo = unique_dir("history-score");
+    fs::create_dir_all(&repo).expect("repo dir should exist");
+
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.name", "Tomohiro"]);
+    git(&repo, &["config", "user.email", "tomohiro@example.com"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+
+    write_file(&repo.join("src/hot.rs"), "pub fn hot() -> i32 {\n    1\n}\n");
+    write_file(&repo.join("src/cold.rs"), "pub fn cold() -> i32 {\n    1\n}\n");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+
+    for value in ["2", "3", "4", "5"] {
+        write_file(
+            &repo.join("src/hot.rs"),
+            &format!("pub fn hot() -> i32 {{\n    {value}\n}}\n"),
+        );
+        git(&repo, &["add", "src/hot.rs"]);
+        git(&repo, &["commit", "-m", "touch hot"]);
+    }
+
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+
+    write_file(
+        &repo.join("src/hot.rs"),
+        "pub fn hot() -> i32 {\n    if needs_hot_path() {\n        return compute_hot();\n    }\n    0\n}\n",
+    );
+    write_file(
+        &repo.join("src/cold.rs"),
+        "pub fn cold() -> i32 {\n    let next = compute_cold();\n    next\n}\n",
+    );
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "change both"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let report = analyze_request(
+        &AnalyzeRequest {
+            input: AnalyzeInput::GitRevisionRange {
+                repo_root: repo.clone(),
+                base,
+                head,
+            },
+            repo_root: Some(repo.clone()),
+        },
+        &[],
+    )
+    .expect("analysis should succeed");
+
+    let hot_reason = report
+        .reasons
+        .iter()
+        .find(|reason| reason.kind == ReasonKind::RepoHotspot && reason.file == "src/hot.rs");
+    let cold_reason = report
+        .reasons
+        .iter()
+        .find(|reason| reason.kind == ReasonKind::RepoHotspot && reason.file == "src/cold.rs");
+
+    assert!(hot_reason.is_some(), "reasons were {:?}", report.reasons);
+    assert!(cold_reason.is_none(), "reasons were {:?}", report.reasons);
+}
+
+#[test]
+fn large_test_patch_gets_smaller_size_bump_than_production_patch() {
+    let production_patch = single_file_patch(
+        "src/lib.rs",
+        "src/lib.rs",
+        &["let status = old_status;"],
+        &[
+            "let first = compute_first();",
+            "let second = compute_second();",
+            "let third = compute_third();",
+            "let fourth = compute_fourth();",
+            "let fifth = compute_fifth();",
+            "let sixth = compute_sixth();",
+            "let seventh = compute_seventh();",
+            "let eighth = compute_eighth();",
+            "let ninth = compute_ninth();",
+            "let tenth = compute_tenth();",
+            "let eleventh = compute_eleventh();",
+            "let twelfth = compute_twelfth();",
+        ],
+    );
+    let test_patch = single_file_patch(
+        "tests/lib_test.rs",
+        "tests/lib_test.rs",
+        &["let status = old_status;"],
+        &[
+            "let first = compute_first();",
+            "let second = compute_second();",
+            "let third = compute_third();",
+            "let fourth = compute_fourth();",
+            "let fifth = compute_fifth();",
+            "let sixth = compute_sixth();",
+            "let seventh = compute_seventh();",
+            "let eighth = compute_eighth();",
+            "let ninth = compute_ninth();",
+            "let tenth = compute_tenth();",
+            "let eleventh = compute_eleventh();",
+            "let twelfth = compute_twelfth();",
+        ],
+    );
+
+    let production_report =
+        analyze_patch(&production_patch, &[]).expect("analysis should succeed");
+    let test_report = analyze_patch(&test_patch, &[]).expect("analysis should succeed");
+
+    assert!(
+        production_report.score > test_report.score,
+        "production={}, test={}",
+        production_report.score,
+        test_report.score
+    );
+}
+
+#[test]
+fn repo_hotspot_does_not_raise_generic_change_without_semantic_risk() {
+    let repo = unique_dir("history-generic");
+    fs::create_dir_all(&repo).expect("repo dir should exist");
+
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.name", "Tomohiro"]);
+    git(&repo, &["config", "user.email", "tomohiro@example.com"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+
+    write_file(&repo.join("src/hot.rs"), "pub fn hot() -> i32 {\n    1\n}\n");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+
+    for value in ["2", "3", "4", "5"] {
+        write_file(
+            &repo.join("src/hot.rs"),
+            &format!("pub fn hot() -> i32 {{\n    {value}\n}}\n"),
+        );
+        git(&repo, &["add", "src/hot.rs"]);
+        git(&repo, &["commit", "-m", "touch hot"]);
+    }
+
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+
+    write_file(
+        &repo.join("src/hot.rs"),
+        "pub fn hot() -> i32 {\n    let next = compute_hot();\n    next\n}\n",
+    );
+    git(&repo, &["add", "src/hot.rs"]);
+    git(&repo, &["commit", "-m", "generic change"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let report = analyze_request(
+        &AnalyzeRequest {
+            input: AnalyzeInput::GitRevisionRange {
+                repo_root: repo.clone(),
+                base,
+                head,
+            },
+            repo_root: Some(repo.clone()),
+        },
+        &[],
+    )
+    .expect("analysis should succeed");
+
+    assert!(
+        !report
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == ReasonKind::RepoHotspot),
+        "reasons were {:?}",
+        report.reasons
+    );
+}
+
+#[test]
+fn semantic_change_stays_above_large_generic_change() {
+    let generic_patch = single_file_patch(
+        "src/lib.rs",
+        "src/lib.rs",
+        &["let status = old_status;"],
+        &[
+            "let first = compute_first();",
+            "let second = compute_second();",
+            "let third = compute_third();",
+            "let fourth = compute_fourth();",
+            "let fifth = compute_fifth();",
+            "let sixth = compute_sixth();",
+            "let seventh = compute_seventh();",
+            "let eighth = compute_eighth();",
+            "let ninth = compute_ninth();",
+            "let tenth = compute_tenth();",
+            "let eleventh = compute_eleventh();",
+            "let twelfth = compute_twelfth();",
+        ],
+    );
+    let semantic_patch = single_file_patch(
+        "src/lib.rs",
+        "src/lib.rs",
+        &["let value = compute();"],
+        &["if needs_retry() {", "    return compute_retry();", "}"],
+    );
+
+    let generic_report = analyze_patch(&generic_patch, &[]).expect("analysis should succeed");
+    let semantic_report = analyze_patch(&semantic_patch, &[]).expect("analysis should succeed");
+
+    assert!(
+        semantic_report.score > generic_report.score,
+        "generic={}, semantic={}",
+        generic_report.score,
+        semantic_report.score
+    );
+}
+
+#[test]
+fn secondary_files_do_not_overwhelm_the_highest_risk_file() {
+    let patch = format!(
+        "{}{}{}{}",
+        single_file_patch(
+            "src/api.rs",
+            "src/api.rs",
+            &["pub fn run() -> i32 {"],
+            &["pub fn run(strict: bool) -> i32 {"],
+        ),
+        single_file_patch(
+            "src/a.rs",
+            "src/a.rs",
+            &["let status = old_status;"],
+            &[
+                "let first = compute_first();",
+                "let second = compute_second();",
+                "let third = compute_third();",
+                "let fourth = compute_fourth();",
+                "let fifth = compute_fifth();",
+                "let sixth = compute_sixth();",
+            ],
+        ),
+        single_file_patch(
+            "src/b.rs",
+            "src/b.rs",
+            &["let status = old_status;"],
+            &[
+                "let first = compute_first();",
+                "let second = compute_second();",
+                "let third = compute_third();",
+                "let fourth = compute_fourth();",
+                "let fifth = compute_fifth();",
+                "let sixth = compute_sixth();",
+            ],
+        ),
+        single_file_patch(
+            "src/c.rs",
+            "src/c.rs",
+            &["let status = old_status;"],
+            &[
+                "let first = compute_first();",
+                "let second = compute_second();",
+                "let third = compute_third();",
+                "let fourth = compute_fourth();",
+                "let fifth = compute_fifth();",
+                "let sixth = compute_sixth();",
+            ],
+        ),
+    );
+
+    let report = analyze_patch(&patch, &[]).expect("analysis should succeed");
+
+    assert!(report.score < 95, "score was {}", report.score);
+}
+
+#[test]
 fn plugin_can_add_signal() {
     let patch = single_file_patch(
         "src/lib.rs",
@@ -170,9 +530,9 @@ fn config_can_lower_public_interface_weight() {
             review_recommended_max: 59,
         },
         aggregation: shiwake::AggregationConfig {
-            top_file_weight: 1.0,
-            secondary_file_weight: 0.33,
             max_score: 100,
+            secondary_ratio: 0.2,
+            secondary_cap: 12,
         },
         rules: vec![RuleConfig {
             kind: ReasonKind::PublicInterfaceChange,
@@ -202,9 +562,9 @@ fn config_can_change_decision_thresholds() {
             review_recommended_max: 15,
         },
         aggregation: shiwake::AggregationConfig {
-            top_file_weight: 1.0,
-            secondary_file_weight: 0.33,
             max_score: 100,
+            secondary_ratio: 0.2,
+            secondary_cap: 12,
         },
         rules: vec![RuleConfig {
             kind: ReasonKind::GenericCodeChange,
@@ -230,9 +590,9 @@ skip_review_max = 10
 review_recommended_max = 50
 
 [aggregation]
-top_file_weight = 1.0
-secondary_file_weight = 0.5
 max_score = 80
+secondary_ratio = 0.2
+secondary_cap = 10
 
 [[rules]]
 kind = "control_flow_change"
@@ -244,6 +604,7 @@ score = 70
     assert_eq!(config.scoring_model_version, "custom-v1");
     assert_eq!(config.decision_thresholds.skip_review_max, 10);
     assert_eq!(config.aggregation.max_score, 80);
+    assert_eq!(config.aggregation.secondary_cap, 10);
     assert_eq!(config.rules.len(), 1);
     assert_eq!(config.rules[0].kind, ReasonKind::ControlFlowChange);
     assert_eq!(config.rules[0].score, 70);
@@ -276,7 +637,7 @@ fn go_plugin_adds_signal_for_select_statements() {
                 && reason.message.contains("go select")),
     );
     assert_eq!(report.confidence.as_str(), "medium");
-    assert!(report.score >= 75, "score was {}", report.score);
+    assert!(report.score >= 65, "score was {}", report.score);
 }
 
 #[test]
@@ -299,5 +660,141 @@ fn go_plugin_adds_signal_for_exported_api_changes() {
                 && reason.message.contains("exported go api")),
     );
     assert_eq!(report.confidence.as_str(), "medium");
-    assert!(report.score >= 85, "score was {}", report.score);
+    assert!(report.score >= 70, "score was {}", report.score);
+}
+
+#[test]
+fn go_test_file_changes_are_scored_lower_than_production_logic_changes() {
+    let patch = format!(
+        "{}{}",
+        single_file_patch(
+            "server/component/ride-dispatch/e2etest/graphql_unkan_query_notifications_test.go",
+            "server/component/ride-dispatch/e2etest/graphql_unkan_query_notifications_test.go",
+            &["func TestNotifications(t *testing.T) {}", "return existingNotification"],
+            &[
+                "func TestNotifications_NotificationLevel(t *testing.T) {",
+                "if got != want {",
+                "    t.Fatal(diff)",
+                "}",
+                "}",
+            ],
+        ),
+        single_file_patch(
+            "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+            "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+            &["message := NotificationMessageScheduledRidePreNotification"],
+            &[
+                "message := NotificationMessageScheduledRidePreNotification",
+                "if pref.SkipPickupLocationRegionCheck && !pref.ExternalTaxiVehicleID.Valid {",
+                "    message = NotificationMessageScheduledRidePreNotificationNominationRequired",
+                "}",
+            ],
+        )
+    );
+
+    let report = analyze_patch(&patch, &[]).expect("analysis should succeed");
+    let test_file_reason_kinds: Vec<_> = report
+        .reasons
+        .iter()
+        .filter(|reason| {
+            reason
+                .file
+                .ends_with("graphql_unkan_query_notifications_test.go")
+        })
+        .map(|reason| reason.kind.clone())
+        .collect();
+
+    assert!(
+        !test_file_reason_kinds.contains(&ReasonKind::PublicInterfaceChange),
+        "test file should not be treated as public interface: {test_file_reason_kinds:?}"
+    );
+    assert!(report.score < 90, "score was {}", report.score);
+}
+
+#[test]
+fn local_assignment_branch_scores_lower_than_return_branch() {
+    let light_patch = single_file_patch(
+        "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+        "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+        &["message := NotificationMessageScheduledRidePreNotification"],
+        &[
+            "message := NotificationMessageScheduledRidePreNotification",
+            "if pref.SkipPickupLocationRegionCheck && !pref.ExternalTaxiVehicleID.Valid {",
+            "    message = NotificationMessageScheduledRidePreNotificationNominationRequired",
+            "}",
+        ],
+    );
+    let heavy_patch = single_file_patch(
+        "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+        "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+        &["return message"],
+        &[
+            "if pref.SkipPickupLocationRegionCheck && !pref.ExternalTaxiVehicleID.Valid {",
+            "    return NotificationMessageScheduledRidePreNotificationNominationRequired",
+            "}",
+            "return message",
+        ],
+    );
+
+    let light_report = analyze_patch(&light_patch, &[]).expect("analysis should succeed");
+    let heavy_report = analyze_patch(&heavy_patch, &[]).expect("analysis should succeed");
+
+    let light_reason = light_report
+        .reasons
+        .iter()
+        .find(|reason| reason.kind == ReasonKind::ControlFlowChange)
+        .expect("light patch should have control flow reason");
+    let heavy_reason = heavy_report
+        .reasons
+        .iter()
+        .find(|reason| reason.kind == ReasonKind::ControlFlowChange)
+        .expect("heavy patch should have control flow reason");
+
+    assert!(light_reason.weight < heavy_reason.weight);
+    assert!(light_report.score < heavy_report.score);
+}
+
+#[test]
+fn deeper_nested_branch_scores_higher_than_shallow_branch() {
+    let shallow_patch = single_file_patch(
+        "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+        "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+        &["message := NotificationMessageScheduledRidePreNotification"],
+        &[
+            "message := NotificationMessageScheduledRidePreNotification",
+            "if pref.SkipPickupLocationRegionCheck {",
+            "    message = NotificationMessageScheduledRidePreNotificationNominationRequired",
+            "}",
+        ],
+    );
+    let deep_patch = single_file_patch(
+        "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+        "server/component/ride-dispatch/internal/domain/dispatch/dispatch.go",
+        &["message := NotificationMessageScheduledRidePreNotification"],
+        &[
+            "message := NotificationMessageScheduledRidePreNotification",
+            "if pref.SkipPickupLocationRegionCheck {",
+            "    if !pref.ExternalTaxiVehicleID.Valid {",
+            "        message = NotificationMessageScheduledRidePreNotificationNominationRequired",
+            "    }",
+            "}",
+        ],
+    );
+
+    let shallow_report = analyze_patch(&shallow_patch, &[]).expect("analysis should succeed");
+    let deep_report = analyze_patch(&deep_patch, &[]).expect("analysis should succeed");
+
+    let shallow_reason = shallow_report
+        .reasons
+        .iter()
+        .find(|reason| reason.kind == ReasonKind::ControlFlowChange)
+        .expect("shallow patch should have control flow reason");
+    let deep_reason = deep_report
+        .reasons
+        .iter()
+        .find(|reason| reason.kind == ReasonKind::ControlFlowChange)
+        .expect("deep patch should have control flow reason");
+
+    assert!(shallow_reason.weight < deep_reason.weight);
+    assert!(shallow_report.score < deep_report.score);
 }
