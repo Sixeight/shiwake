@@ -65,6 +65,8 @@ impl From<std::string::FromUtf8Error> for AnalyzeError {
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
     SkipReview,
+    ReviewOptional,
+    ReviewSuggested,
     ReviewRecommended,
     ReviewRequired,
 }
@@ -73,6 +75,8 @@ impl Decision {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::SkipReview => "skip_review",
+            Self::ReviewOptional => "review_optional",
+            Self::ReviewSuggested => "review_suggested",
             Self::ReviewRecommended => "review_recommended",
             Self::ReviewRequired => "review_required",
         }
@@ -141,6 +145,8 @@ pub struct RuleConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct DecisionThresholds {
     pub skip_review_max: u32,
+    pub review_optional_max: u32,
+    pub review_suggested_max: u32,
     pub review_recommended_max: u32,
 }
 
@@ -169,6 +175,8 @@ impl ScoreConfig {
             scoring_model_version: SCORING_MODEL_VERSION.to_string(),
             decision_thresholds: DecisionThresholds {
                 skip_review_max: 24,
+                review_optional_max: 29,
+                review_suggested_max: 39,
                 review_recommended_max: 59,
             },
             aggregation: AggregationConfig {
@@ -604,12 +612,9 @@ fn build_context(
             repo_root,
             base,
             head,
-        } => build_git_revision_context(
-            repo_root,
-            base,
-            head,
-            &config.gitattributes_skip_attributes,
-        ),
+        } => {
+            build_git_revision_context(repo_root, base, head, &config.gitattributes_skip_attributes)
+        }
     }
 }
 
@@ -868,7 +873,9 @@ fn compile_gitattributes_matchers(pattern: &str) -> Result<Vec<GlobMatcher>, Ana
             Glob::new(&value)
                 .map(|glob| glob.compile_matcher())
                 .map_err(|error| {
-                    AnalyzeError::Command(format!("invalid .gitattributes pattern `{value}`: {error}"))
+                    AnalyzeError::Command(format!(
+                        "invalid .gitattributes pattern `{value}`: {error}"
+                    ))
                 })
         })
         .collect()
@@ -880,7 +887,11 @@ impl GeneratedFileMatcher {
         let mut state = false;
 
         for rule in &self.rules {
-            if rule.matchers.iter().any(|matcher| matcher.is_match(&normalized)) {
+            if rule
+                .matchers
+                .iter()
+                .any(|matcher| matcher.is_match(&normalized))
+            {
                 state = rule.generated;
             }
         }
@@ -914,7 +925,11 @@ fn apply_plugin_finding(
     score.recompute_score(config.aggregation.max_score);
 
     feature_vector.plugin_signals += 1;
-    reasons.push(finding.kind.as_reason(finding.path, weight, finding.message));
+    reasons.push(
+        finding
+            .kind
+            .as_reason(finding.path, weight, finding.message),
+    );
 }
 
 fn collect_file_scores(
@@ -960,7 +975,8 @@ fn score_file(
     let base = detect_base_scoring(file, reasons, feature_vector, config);
     let (size_modifier, hotspot_modifier) =
         compute_modifiers(file, &base, reasons, feature_vector, config);
-    let score = (base.base_score + size_modifier + hotspot_modifier).min(config.aggregation.max_score);
+    let score =
+        (base.base_score + size_modifier + hotspot_modifier).min(config.aggregation.max_score);
 
     FileScoreState {
         base_score: base.base_score,
@@ -972,7 +988,11 @@ fn score_file(
     }
 }
 
-fn comment_only_score(file: &ChangedFile, reasons: &mut Vec<Reason>, config: &ScoreConfig) -> FileScoreState {
+fn comment_only_score(
+    file: &ChangedFile,
+    reasons: &mut Vec<Reason>,
+    config: &ScoreConfig,
+) -> FileScoreState {
     let score = config.score_for(&ReasonKind::CommentOnly);
     reasons.push(ReasonKind::CommentOnly.as_reason(
         file.path.clone(),
@@ -1083,9 +1103,17 @@ fn compute_modifiers(
     config: &ScoreConfig,
 ) -> (u32, u32) {
     let modifier_cap = modifier_cap(base.base_score);
-    let size_modifier = compute_size_modifier(file, base, modifier_cap, reasons, feature_vector, config);
-    let hotspot_modifier =
-        compute_hotspot_modifier(file, base, modifier_cap, size_modifier, reasons, feature_vector, config);
+    let size_modifier =
+        compute_size_modifier(file, base, modifier_cap, reasons, feature_vector, config);
+    let hotspot_modifier = compute_hotspot_modifier(
+        file,
+        base,
+        modifier_cap,
+        size_modifier,
+        reasons,
+        feature_vector,
+        config,
+    );
 
     (size_modifier, hotspot_modifier)
 }
@@ -1119,7 +1147,10 @@ fn compute_size_modifier(
     reasons.push(ReasonKind::ChangeSize.as_reason(
         file.path.clone(),
         size_modifier,
-        format!("change size increased review load ({} changed lines)", change_volume(file)),
+        format!(
+            "change size increased review load ({} changed lines)",
+            change_volume(file)
+        ),
     ));
 
     size_modifier
@@ -1166,11 +1197,7 @@ fn aggregate_scores(scores: &[FileScoreState], config: &AggregationConfig) -> (u
 
     let top_score = sorted.first().map(|file| file.score).unwrap_or_default();
     let has_semantic_risk = sorted.iter().any(|file| file.has_semantic_risk);
-    let secondary_raw: u32 = sorted
-        .iter()
-        .skip(1)
-        .map(|file| file.score.min(30))
-        .sum();
+    let secondary_raw: u32 = sorted.iter().skip(1).map(|file| file.score.min(30)).sum();
     let secondary_contribution = if has_semantic_risk {
         ((secondary_raw as f64) * config.secondary_ratio)
             .round()
@@ -1190,6 +1217,14 @@ fn aggregate_scores(scores: &[FileScoreState], config: &AggregationConfig) -> (u
 fn score_to_decision(score: u32, config: &DecisionThresholds) -> Decision {
     if score <= config.skip_review_max {
         return Decision::SkipReview;
+    }
+
+    if score <= config.review_optional_max {
+        return Decision::ReviewOptional;
+    }
+
+    if score <= config.review_suggested_max {
+        return Decision::ReviewSuggested;
     }
 
     if score <= config.review_recommended_max {
@@ -1302,7 +1337,11 @@ fn normalize_diff_path(path: &str) -> Option<String> {
     Some(strip_diff_prefix(path))
 }
 
-fn read_file_history(repo_root: &Path, base: &str, path: &str) -> Result<FileHistory, AnalyzeError> {
+fn read_file_history(
+    repo_root: &Path,
+    base: &str,
+    path: &str,
+) -> Result<FileHistory, AnalyzeError> {
     let commit_count = git_stdout(repo_root, &["rev-list", "--count", base, "--", path])?;
     let author_log = git_stdout(repo_root, &["log", "--format=%an", base, "--", path])?;
     let prior_authors = author_log
@@ -1453,15 +1492,7 @@ fn approximate_branch_nesting_depth(file: &ChangedFile) -> usize {
 
 fn starts_branch(trimmed: &str) -> bool {
     [
-        "if ",
-        "if(",
-        "else if",
-        "match ",
-        "switch ",
-        "for ",
-        "while ",
-        "select ",
-        "select{",
+        "if ", "if(", "else if", "match ", "switch ", "for ", "while ", "select ", "select{",
         "select {",
     ]
     .iter()
@@ -1614,8 +1645,7 @@ fn change_size_weight(file: &ChangedFile, config: &ScoreConfig) -> Option<u32> {
         .or(file.before_source.as_deref())
         .map(|source| changed_lines as f64 / source.lines().count().max(1) as f64);
 
-    let mut score: u32 = if changed_lines >= 25 || changed_ratio.is_some_and(|ratio| ratio >= 0.6)
-    {
+    let mut score: u32 = if changed_lines >= 25 || changed_ratio.is_some_and(|ratio| ratio >= 0.6) {
         12
     } else if changed_lines >= 10 || changed_ratio.is_some_and(|ratio| ratio >= 0.3) {
         8

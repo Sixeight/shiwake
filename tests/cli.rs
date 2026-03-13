@@ -60,6 +60,8 @@ scoring_model_version = "custom-v1"
 
 [decision_thresholds]
 skip_review_max = 10
+review_optional_max = 20
+review_suggested_max = 25
 review_recommended_max = 30
 
 [aggregation]
@@ -118,7 +120,7 @@ score = 10
         "stdout was {output}"
     );
     assert!(
-        output.contains("\"decision\":\"review_recommended\""),
+        output.contains("\"decision\":\"review_optional\""),
         "stdout was {output}"
     );
 

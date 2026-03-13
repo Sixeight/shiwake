@@ -310,8 +310,14 @@ fn revision_range_adds_repo_hotspot_signal_for_frequently_touched_file() {
     git(&repo, &["config", "user.email", "tomohiro@example.com"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
 
-    write_file(&repo.join("src/hot.rs"), "pub fn hot() -> i32 {\n    1\n}\n");
-    write_file(&repo.join("src/cold.rs"), "pub fn cold() -> i32 {\n    1\n}\n");
+    write_file(
+        &repo.join("src/hot.rs"),
+        "pub fn hot() -> i32 {\n    1\n}\n",
+    );
+    write_file(
+        &repo.join("src/cold.rs"),
+        "pub fn cold() -> i32 {\n    1\n}\n",
+    );
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "initial"]);
 
@@ -405,8 +411,7 @@ fn large_test_patch_gets_smaller_size_bump_than_production_patch() {
         ],
     );
 
-    let production_report =
-        analyze_patch(&production_patch, &[]).expect("analysis should succeed");
+    let production_report = analyze_patch(&production_patch, &[]).expect("analysis should succeed");
     let test_report = analyze_patch(&test_patch, &[]).expect("analysis should succeed");
 
     assert!(
@@ -427,7 +432,10 @@ fn repo_hotspot_does_not_raise_generic_change_without_semantic_risk() {
     git(&repo, &["config", "user.email", "tomohiro@example.com"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
 
-    write_file(&repo.join("src/hot.rs"), "pub fn hot() -> i32 {\n    1\n}\n");
+    write_file(
+        &repo.join("src/hot.rs"),
+        "pub fn hot() -> i32 {\n    1\n}\n",
+    );
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "initial"]);
 
@@ -487,8 +495,14 @@ fn generated_files_from_gitattributes_are_excluded_from_scoring() {
         &repo.join(".gitattributes"),
         "gen/** linguist-generated=true\n",
     );
-    write_file(&repo.join("gen/output.go"), "package gen\n\nfunc Build() int {\n    return 1\n}\n");
-    write_file(&repo.join("src/lib.rs"), "pub fn score() -> i32 {\n    1\n}\n");
+    write_file(
+        &repo.join("gen/output.go"),
+        "package gen\n\nfunc Build() int {\n    return 1\n}\n",
+    );
+    write_file(
+        &repo.join("src/lib.rs"),
+        "pub fn score() -> i32 {\n    1\n}\n",
+    );
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "initial"]);
     let base = git(&repo, &["rev-parse", "HEAD"]);
@@ -519,12 +533,18 @@ fn generated_files_from_gitattributes_are_excluded_from_scoring() {
     .expect("analysis should succeed");
 
     assert!(
-        report.by_file.iter().all(|file| file.path != "gen/output.go"),
+        report
+            .by_file
+            .iter()
+            .all(|file| file.path != "gen/output.go"),
         "by_file was {:?}",
         report.by_file
     );
     assert!(
-        report.reasons.iter().all(|reason| reason.file != "gen/output.go"),
+        report
+            .reasons
+            .iter()
+            .all(|reason| reason.file != "gen/output.go"),
         "reasons were {:?}",
         report.reasons
     );
@@ -544,7 +564,14 @@ fn generated_files_are_excluded_for_patch_input_when_repo_root_is_known() {
         "gen/output.go",
         "gen/output.go",
         &["func Build() int {", "    return 1", "}"],
-        &["func Build() int {", "    if useNewFlow() {", "        return 2", "    }", "    return 1", "}"],
+        &[
+            "func Build() int {",
+            "    if useNewFlow() {",
+            "        return 2",
+            "    }",
+            "    return 1",
+            "}",
+        ],
     );
 
     let report = analyze_request(
@@ -557,8 +584,16 @@ fn generated_files_are_excluded_for_patch_input_when_repo_root_is_known() {
     .expect("analysis should succeed");
 
     assert_eq!(report.score, 0, "report was {:?}", report);
-    assert!(report.by_file.is_empty(), "by_file was {:?}", report.by_file);
-    assert!(report.reasons.is_empty(), "reasons were {:?}", report.reasons);
+    assert!(
+        report.by_file.is_empty(),
+        "by_file was {:?}",
+        report.by_file
+    );
+    assert!(
+        report.reasons.is_empty(),
+        "reasons were {:?}",
+        report.reasons
+    );
 }
 
 #[test]
@@ -575,8 +610,14 @@ fn generated_file_attributes_can_be_customized_in_config() {
         &repo.join(".gitattributes"),
         "gen/** pr-review-skip\nraw/** linguist-generated=true\n",
     );
-    write_file(&repo.join("gen/output.go"), "package gen\n\nfunc Build() int {\n    return 1\n}\n");
-    write_file(&repo.join("raw/output.go"), "package raw\n\nfunc Build() int {\n    return 1\n}\n");
+    write_file(
+        &repo.join("gen/output.go"),
+        "package gen\n\nfunc Build() int {\n    return 1\n}\n",
+    );
+    write_file(
+        &repo.join("raw/output.go"),
+        "package raw\n\nfunc Build() int {\n    return 1\n}\n",
+    );
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "initial"]);
     let base = git(&repo, &["rev-parse", "HEAD"]);
@@ -601,6 +642,8 @@ gitattributes_skip_attributes = ["pr-review-skip"]
 
 [decision_thresholds]
 skip_review_max = 24
+review_optional_max = 29
+review_suggested_max = 39
 review_recommended_max = 59
 
 [aggregation]
@@ -630,12 +673,18 @@ score = 65
     .expect("analysis should succeed");
 
     assert!(
-        report.by_file.iter().all(|file| file.path != "gen/output.go"),
+        report
+            .by_file
+            .iter()
+            .all(|file| file.path != "gen/output.go"),
         "by_file was {:?}",
         report.by_file
     );
     assert!(
-        report.by_file.iter().any(|file| file.path == "raw/output.go"),
+        report
+            .by_file
+            .iter()
+            .any(|file| file.path == "raw/output.go"),
         "by_file was {:?}",
         report.by_file
     );
@@ -651,7 +700,10 @@ fn medium_semantic_change_with_hotspot_stays_recommended() {
     git(&repo, &["config", "user.email", "tomohiro@example.com"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
 
-    write_file(&repo.join("src/hot.rs"), "pub fn hot() -> i32 {\n    1\n}\n");
+    write_file(
+        &repo.join("src/hot.rs"),
+        "pub fn hot() -> i32 {\n    1\n}\n",
+    );
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "initial"]);
 
@@ -820,6 +872,8 @@ fn config_can_lower_public_interface_weight() {
         scoring_model_version: "custom-v1".to_string(),
         decision_thresholds: shiwake::DecisionThresholds {
             skip_review_max: 24,
+            review_optional_max: 29,
+            review_suggested_max: 39,
             review_recommended_max: 59,
         },
         aggregation: shiwake::AggregationConfig {
@@ -853,7 +907,9 @@ fn config_can_change_decision_thresholds() {
         scoring_model_version: "custom-v1".to_string(),
         decision_thresholds: shiwake::DecisionThresholds {
             skip_review_max: 10,
-            review_recommended_max: 15,
+            review_optional_max: 15,
+            review_suggested_max: 18,
+            review_recommended_max: 19,
         },
         aggregation: shiwake::AggregationConfig {
             max_score: 100,
@@ -874,6 +930,66 @@ fn config_can_change_decision_thresholds() {
 }
 
 #[test]
+fn decision_uses_intermediate_bands() {
+    let patch = single_file_patch(
+        "src/lib.rs",
+        "src/lib.rs",
+        &["pub fn score(diff: &str) -> i32 {"],
+        &["pub fn score(diff: &str, strict: bool) -> i32 {"],
+    );
+    let optional_config = ScoreConfig {
+        schema_version: 1,
+        scoring_model_version: "custom-v1".to_string(),
+        decision_thresholds: shiwake::DecisionThresholds {
+            skip_review_max: 24,
+            review_optional_max: 29,
+            review_suggested_max: 39,
+            review_recommended_max: 59,
+        },
+        aggregation: shiwake::AggregationConfig {
+            max_score: 100,
+            secondary_ratio: 0.2,
+            secondary_cap: 12,
+        },
+        gitattributes_skip_attributes: vec![String::from("linguist-generated")],
+        rules: vec![RuleConfig {
+            kind: ReasonKind::PublicInterfaceChange,
+            score: 28,
+        }],
+    };
+    let suggested_config = ScoreConfig {
+        schema_version: 1,
+        scoring_model_version: "custom-v1".to_string(),
+        decision_thresholds: shiwake::DecisionThresholds {
+            skip_review_max: 24,
+            review_optional_max: 29,
+            review_suggested_max: 39,
+            review_recommended_max: 59,
+        },
+        aggregation: shiwake::AggregationConfig {
+            max_score: 100,
+            secondary_ratio: 0.2,
+            secondary_cap: 12,
+        },
+        gitattributes_skip_attributes: vec![String::from("linguist-generated")],
+        rules: vec![RuleConfig {
+            kind: ReasonKind::PublicInterfaceChange,
+            score: 39,
+        }],
+    };
+
+    let optional_report =
+        analyze_patch_with_config(&patch, &[], &optional_config).expect("analysis should succeed");
+    let suggested_report =
+        analyze_patch_with_config(&patch, &[], &suggested_config).expect("analysis should succeed");
+
+    assert_eq!(optional_report.score, 28);
+    assert_eq!(optional_report.decision.as_str(), "review_optional");
+    assert_eq!(suggested_report.score, 39);
+    assert_eq!(suggested_report.decision.as_str(), "review_suggested");
+}
+
+#[test]
 fn score_config_parses_from_toml() {
     let config = ScoreConfig::from_toml(
         r#"
@@ -883,6 +999,8 @@ gitattributes_skip_attributes = ["linguist-generated", "pr-review-skip"]
 
 [decision_thresholds]
 skip_review_max = 10
+review_optional_max = 20
+review_suggested_max = 35
 review_recommended_max = 50
 
 [aggregation]
@@ -899,6 +1017,8 @@ score = 70
 
     assert_eq!(config.scoring_model_version, "custom-v1");
     assert_eq!(config.decision_thresholds.skip_review_max, 10);
+    assert_eq!(config.decision_thresholds.review_optional_max, 20);
+    assert_eq!(config.decision_thresholds.review_suggested_max, 35);
     assert_eq!(config.aggregation.max_score, 80);
     assert_eq!(config.aggregation.secondary_cap, 10);
     assert_eq!(
@@ -973,7 +1093,10 @@ fn go_test_file_changes_are_scored_lower_than_production_logic_changes() {
         single_file_patch(
             "server/component/ride-dispatch/e2etest/graphql_unkan_query_notifications_test.go",
             "server/component/ride-dispatch/e2etest/graphql_unkan_query_notifications_test.go",
-            &["func TestNotifications(t *testing.T) {}", "return existingNotification"],
+            &[
+                "func TestNotifications(t *testing.T) {}",
+                "return existingNotification"
+            ],
             &[
                 "func TestNotifications_NotificationLevel(t *testing.T) {",
                 "if got != want {",

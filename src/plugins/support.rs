@@ -20,11 +20,7 @@ pub fn changed_files_with_extension(ctx: &AnalysisContext, extension: &str) -> V
         .collect()
 }
 
-pub fn base_finding(
-    path: String,
-    kind: ReasonKind,
-    message: impl Into<String>,
-) -> PluginFinding {
+pub fn base_finding(path: String, kind: ReasonKind, message: impl Into<String>) -> PluginFinding {
     PluginFinding {
         path,
         kind,

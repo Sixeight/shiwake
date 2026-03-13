@@ -116,6 +116,8 @@ gitattributes_skip_attributes = ["linguist-generated", "pr-review-skip"]
 
 [decision_thresholds]
 skip_review_max = 24
+review_optional_max = 29
+review_suggested_max = 39
 review_recommended_max = 59
 
 [aggregation]
@@ -180,7 +182,9 @@ This keeps semantic risk as the main driver while letting patch size and repo hi
 ### Default Decision Thresholds
 
 - `0-24`: `skip_review`
-- `25-59`: `review_recommended`
+- `25-29`: `review_optional`
+- `30-39`: `review_suggested`
+- `40-59`: `review_recommended`
 - `60+`: `review_required`
 
 ### Common Reason Kinds
