@@ -413,16 +413,14 @@ fn go_test_oracle_changed(file: &crate::ChangedFile) -> bool {
         return false;
     }
 
-    file.added.iter().chain(file.removed.iter()).any(|line| {
-        let trimmed = line.trim();
-        trimmed.contains("cmp.Diff(")
-            || trimmed.contains("assert.")
-            || trimmed.contains("require.")
-            || trimmed.contains("t.Fatal(")
-            || trimmed.contains("t.Fatalf(")
-            || trimmed.contains("t.Error(")
-            || trimmed.contains("t.Errorf(")
-    })
+    let removed = crate::normalized_test_oracle_lines(&file.removed);
+    let added = crate::normalized_test_oracle_lines(&file.added);
+
+    if removed.is_empty() && added.is_empty() {
+        return false;
+    }
+
+    removed != added
 }
 
 fn go_concurrency_weight(snapshot: Option<&HelperFileSnapshot>) -> u32 {

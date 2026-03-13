@@ -1469,13 +1469,110 @@ fn starts_branch(trimmed: &str) -> bool {
 }
 
 fn has_test_expectation_change(file: &ChangedFile) -> bool {
-    file.added.iter().chain(file.removed.iter()).any(|line| {
-        let trimmed = line.trim();
-        trimmed.contains("assert")
-            || trimmed.contains("expect(")
-            || trimmed.contains("snapshot")
-            || trimmed.contains("require.")
-    })
+    let removed = normalized_test_oracle_lines(&file.removed);
+    let added = normalized_test_oracle_lines(&file.added);
+
+    if removed.is_empty() && added.is_empty() {
+        return false;
+    }
+
+    removed != added
+}
+
+pub(crate) fn normalized_test_oracle_lines(lines: &[String]) -> Vec<String> {
+    let mut normalized: Vec<String> = lines
+        .iter()
+        .filter_map(|line| normalize_test_oracle_line(line))
+        .collect();
+    normalized.sort_unstable();
+    normalized
+}
+
+fn normalize_test_oracle_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !(trimmed.contains("assert.")
+        || trimmed.contains("require.")
+        || trimmed.contains("expect(")
+        || trimmed.contains("snapshot")
+        || trimmed.contains("cmp.Diff("))
+    {
+        return None;
+    }
+
+    if trimmed.contains("assert.") || trimmed.contains("require.") {
+        return Some(normalize_assert_like_line(trimmed));
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn normalize_assert_like_line(line: &str) -> String {
+    let Some(open_paren) = line.find('(') else {
+        return line.to_string();
+    };
+    let Some(close_paren) = line.rfind(')') else {
+        return line.to_string();
+    };
+
+    let callee = line[..open_paren].trim();
+    let args = split_top_level_args(&line[open_paren + 1..close_paren]);
+    if args.is_empty() {
+        return line.to_string();
+    }
+
+    let semantic_arg_count = match args.len() {
+        0..=3 => args.len(),
+        _ => 3,
+    };
+    let semantic_args = args
+        .into_iter()
+        .take(semantic_arg_count)
+        .map(|arg| arg.trim().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("{callee}({semantic_args})")
+}
+
+fn split_top_level_args(input: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(input[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        args.push(tail);
+    }
+
+    args
 }
 
 fn is_refactor_like(file: &ChangedFile) -> bool {

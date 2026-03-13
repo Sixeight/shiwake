@@ -603,6 +603,108 @@ fn go_plugin_detects_test_oracle_change() {
 }
 
 #[test]
+fn go_plugin_ignores_test_failure_message_only_change() {
+    let repo = unique_dir("go-test-message-only");
+    fs::create_dir_all(&repo).expect("repo dir should exist");
+
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.name", "Tomohiro"]);
+    git(&repo, &["config", "user.email", "tomohiro@example.com"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    write_file(
+        &repo.join("go.mod"),
+        "module example.com/shiwake-test\n\ngo 1.26.0\n",
+    );
+    write_file(
+        &repo.join("main_test.go"),
+        "package main\n\nimport \"testing\"\n\nfunc TestValue(t *testing.T) {\n    if got := value(); got != 1 {\n        t.Fatalf(\"unexpected value: %d\", got)\n    }\n}\n",
+    );
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+
+    write_file(
+        &repo.join("main_test.go"),
+        "package main\n\nimport \"testing\"\n\nfunc TestValue(t *testing.T) {\n    if got := value(); got != 1 {\n        t.Fatalf(\"value mismatch: %d\", got)\n    }\n}\n",
+    );
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "update"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let assert = Command::cargo_bin("shiwake")
+        .expect("binary should build")
+        .args([
+            "--repo",
+            repo.to_str().expect("repo path should be utf8"),
+            "--base",
+            &base,
+            "--head",
+            &head,
+            "--plugin",
+            "go",
+        ])
+        .assert();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+
+    assert!(
+        !output.contains("\"kind\":\"go_test_oracle_change\""),
+        "stdout was {output}"
+    );
+}
+
+#[test]
+fn go_plugin_ignores_assert_message_only_change() {
+    let repo = unique_dir("go-assert-message-only");
+    fs::create_dir_all(&repo).expect("repo dir should exist");
+
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.name", "Tomohiro"]);
+    git(&repo, &["config", "user.email", "tomohiro@example.com"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    write_file(
+        &repo.join("go.mod"),
+        "module example.com/shiwake-test\n\ngo 1.26.0\n",
+    );
+    write_file(
+        &repo.join("main_test.go"),
+        "package main\n\nimport (\n    \"testing\"\n    \"github.com/stretchr/testify/require\"\n)\n\nfunc TestValue(t *testing.T) {\n    require.Equalf(t, 1, value(), \"unexpected value\")\n}\n",
+    );
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+
+    write_file(
+        &repo.join("main_test.go"),
+        "package main\n\nimport (\n    \"testing\"\n    \"github.com/stretchr/testify/require\"\n)\n\nfunc TestValue(t *testing.T) {\n    require.Equalf(t, 1, value(), \"value mismatch\")\n}\n",
+    );
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "update"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let assert = Command::cargo_bin("shiwake")
+        .expect("binary should build")
+        .args([
+            "--repo",
+            repo.to_str().expect("repo path should be utf8"),
+            "--base",
+            &base,
+            "--head",
+            &head,
+            "--plugin",
+            "go",
+        ])
+        .assert();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+
+    assert!(
+        !output.contains("\"kind\":\"go_test_oracle_change\""),
+        "stdout was {output}"
+    );
+}
+
+#[test]
 fn go_plugin_detects_context_retry_time_change() {
     let initial = r#"package main
 
