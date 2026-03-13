@@ -8,6 +8,7 @@ use std::{
 };
 
 use git2::{Repository, Tree};
+use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
 const SCORING_MODEL_VERSION: &str = "v1";
@@ -156,6 +157,8 @@ pub struct ScoreConfig {
     pub scoring_model_version: String,
     pub decision_thresholds: DecisionThresholds,
     pub aggregation: AggregationConfig,
+    #[serde(default = "default_gitattributes_skip_attributes")]
+    pub gitattributes_skip_attributes: Vec<String>,
     pub rules: Vec<RuleConfig>,
 }
 
@@ -173,6 +176,7 @@ impl ScoreConfig {
                 secondary_ratio: 0.2,
                 secondary_cap: 12,
             },
+            gitattributes_skip_attributes: default_gitattributes_skip_attributes(),
             rules: vec![
                 RuleConfig {
                     kind: ReasonKind::CommentOnly,
@@ -265,6 +269,10 @@ impl ScoreConfig {
             .map(|rule| rule.score)
             .unwrap_or_default()
     }
+}
+
+fn default_gitattributes_skip_attributes() -> Vec<String> {
+    vec![String::from("linguist-generated")]
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -429,6 +437,17 @@ pub struct ScoreReport {
     pub feature_vector: FeatureVector,
 }
 
+#[derive(Debug)]
+struct GeneratedFileMatcher {
+    rules: Vec<GeneratedRule>,
+}
+
+#[derive(Debug)]
+struct GeneratedRule {
+    matchers: Vec<GlobMatcher>,
+    generated: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct FileScoreState {
     base_score: u32,
@@ -492,7 +511,7 @@ pub fn analyze_request_with_config(
     plugins: &[&dyn AnalyzerPlugin],
     config: &ScoreConfig,
 ) -> Result<ScoreReport, AnalyzeError> {
-    let (ctx, _guard) = build_context(request)?;
+    let (ctx, _guard) = build_context(request, config)?;
     let mut reasons = Vec::new();
     let mut feature_vector = FeatureVector {
         files_changed: ctx.files.len(),
@@ -554,6 +573,7 @@ impl Drop for WorkspaceGuard {
 
 fn build_context(
     request: &AnalyzeRequest,
+    config: &ScoreConfig,
 ) -> Result<(AnalysisContext, WorkspaceGuard), AnalyzeError> {
     match &request.input {
         AnalyzeInput::PatchText { patch } => {
@@ -561,7 +581,11 @@ fn build_context(
                 return Err(AnalyzeError::EmptyPatch);
             }
 
-            let files = parse_patch(patch)?;
+            let files = filter_generated_files(
+                parse_patch(patch)?,
+                request.repo_root.as_deref(),
+                &config.gitattributes_skip_attributes,
+            )?;
             Ok((
                 AnalysisContext {
                     input_kind: InputKind::PatchText,
@@ -579,7 +603,12 @@ fn build_context(
             repo_root,
             base,
             head,
-        } => build_git_revision_context(repo_root, base, head),
+        } => build_git_revision_context(
+            repo_root,
+            base,
+            head,
+            &config.gitattributes_skip_attributes,
+        ),
     }
 }
 
@@ -587,6 +616,7 @@ fn build_git_revision_context(
     repo_root: &Path,
     base: &str,
     head: &str,
+    gitattributes_skip_attributes: &[String],
 ) -> Result<(AnalysisContext, WorkspaceGuard), AnalyzeError> {
     let repo = Repository::open(repo_root)?;
     let base_commit = peel_commit(&repo, base)?;
@@ -594,7 +624,11 @@ fn build_git_revision_context(
     let base_tree = base_commit.tree()?;
     let head_tree = head_commit.tree()?;
     let patch = git_diff_patch(repo_root, base, head)?;
-    let mut files = parse_patch(&patch)?;
+    let mut files = filter_generated_files(
+        parse_patch(&patch)?,
+        Some(repo_root),
+        gitattributes_skip_attributes,
+    )?;
 
     for file in &mut files {
         file.before_source = read_blob_text(&repo, &base_tree, file.old_path.as_deref())?;
@@ -716,6 +750,142 @@ fn export_tree(repo: &Repository, tree: &Tree<'_>, dest: &Path) -> Result<(), An
     })?;
 
     Ok(())
+}
+
+fn filter_generated_files(
+    files: Vec<ChangedFile>,
+    repo_root: Option<&Path>,
+    skip_attributes: &[String],
+) -> Result<Vec<ChangedFile>, AnalyzeError> {
+    let Some(repo_root) = repo_root else {
+        return Ok(files);
+    };
+    let Some(matcher) = load_generated_file_matcher(repo_root, skip_attributes)? else {
+        return Ok(files);
+    };
+
+    Ok(files
+        .into_iter()
+        .filter(|file| !matcher.is_generated(&file.path))
+        .collect())
+}
+
+fn load_generated_file_matcher(
+    repo_root: &Path,
+    skip_attributes: &[String],
+) -> Result<Option<GeneratedFileMatcher>, AnalyzeError> {
+    if skip_attributes.is_empty() {
+        return Ok(None);
+    }
+    let path = repo_root.join(".gitattributes");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(path)?;
+    let skip_attributes: Vec<String> = skip_attributes
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if skip_attributes.is_empty() {
+        return Ok(None);
+    }
+
+    let mut rules = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let Some(pattern) = parts.next() else {
+            continue;
+        };
+        let Some(generated) = extract_skip_rule(parts.collect(), &skip_attributes) else {
+            continue;
+        };
+        let matchers = compile_gitattributes_matchers(pattern)?;
+        if matchers.is_empty() {
+            continue;
+        }
+
+        rules.push(GeneratedRule {
+            matchers,
+            generated,
+        });
+    }
+
+    if rules.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(GeneratedFileMatcher { rules }))
+}
+
+fn extract_skip_rule(attributes: Vec<&str>, skip_attributes: &[String]) -> Option<bool> {
+    let mut matched = None;
+
+    for attribute in attributes {
+        for target in skip_attributes {
+            if let Some(enabled) = parse_gitattributes_attribute(attribute, target) {
+                matched = Some(enabled);
+            }
+        }
+    }
+
+    matched
+}
+
+fn parse_gitattributes_attribute(attribute: &str, target: &str) -> Option<bool> {
+    if attribute == target {
+        return Some(true);
+    }
+    if attribute == format!("-{target}") || attribute == format!("!{target}") {
+        return Some(false);
+    }
+    if let Some((name, value)) = attribute.split_once('=') {
+        if name != target {
+            return None;
+        }
+        return Some(!matches!(value, "false" | "unset"));
+    }
+
+    None
+}
+
+fn compile_gitattributes_matchers(pattern: &str) -> Result<Vec<GlobMatcher>, AnalyzeError> {
+    let mut patterns = vec![pattern.to_string()];
+    if !pattern.contains('/') {
+        patterns.push(format!("**/{pattern}"));
+    }
+
+    patterns
+        .into_iter()
+        .map(|value| {
+            Glob::new(&value)
+                .map(|glob| glob.compile_matcher())
+                .map_err(|error| {
+                    AnalyzeError::Command(format!("invalid .gitattributes pattern `{value}`: {error}"))
+                })
+        })
+        .collect()
+}
+
+impl GeneratedFileMatcher {
+    fn is_generated(&self, path: &str) -> bool {
+        let normalized = path.replace('\\', "/");
+        let mut state = false;
+
+        for rule in &self.rules {
+            if rule.matchers.iter().any(|matcher| matcher.is_match(&normalized)) {
+                state = rule.generated;
+            }
+        }
+
+        state
+    }
 }
 
 fn apply_plugin_finding(

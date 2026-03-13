@@ -8,7 +8,7 @@ use std::{
 use shiwake::{
     AnalysisContext, AnalyzeInput, AnalyzeRequest, AnalyzerPlugin, Confidence, PluginAnalysis,
     PluginFinding, PluginScoreMode, ReasonKind, RuleConfig, ScoreConfig, analyze_patch,
-    analyze_patch_with_config, analyze_request, plugins::go::GoPlugin,
+    analyze_patch_with_config, analyze_request, analyze_request_with_config, plugins::go::GoPlugin,
 };
 
 fn single_file_patch(old_path: &str, new_path: &str, removed: &[&str], added: &[&str]) -> String {
@@ -399,6 +399,174 @@ fn repo_hotspot_does_not_raise_generic_change_without_semantic_risk() {
 }
 
 #[test]
+fn generated_files_from_gitattributes_are_excluded_from_scoring() {
+    let repo = unique_dir("generated-filter");
+    fs::create_dir_all(&repo).expect("repo dir should exist");
+
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.name", "Tomohiro"]);
+    git(&repo, &["config", "user.email", "tomohiro@example.com"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+
+    write_file(
+        &repo.join(".gitattributes"),
+        "gen/** linguist-generated=true\n",
+    );
+    write_file(&repo.join("gen/output.go"), "package gen\n\nfunc Build() int {\n    return 1\n}\n");
+    write_file(&repo.join("src/lib.rs"), "pub fn score() -> i32 {\n    1\n}\n");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+
+    write_file(
+        &repo.join("gen/output.go"),
+        "package gen\n\nfunc Build() int {\n    if useNewFlow() {\n        return 2\n    }\n    return 1\n}\n",
+    );
+    write_file(
+        &repo.join("src/lib.rs"),
+        "pub fn score() -> i32 {\n    let next = compute_score();\n    next\n}\n",
+    );
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "update"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let report = analyze_request(
+        &AnalyzeRequest {
+            input: AnalyzeInput::GitRevisionRange {
+                repo_root: repo.clone(),
+                base,
+                head,
+            },
+            repo_root: Some(repo.clone()),
+        },
+        &[&GoPlugin],
+    )
+    .expect("analysis should succeed");
+
+    assert!(
+        report.by_file.iter().all(|file| file.path != "gen/output.go"),
+        "by_file was {:?}",
+        report.by_file
+    );
+    assert!(
+        report.reasons.iter().all(|reason| reason.file != "gen/output.go"),
+        "reasons were {:?}",
+        report.reasons
+    );
+    assert_eq!(report.by_file.len(), 1, "by_file was {:?}", report.by_file);
+}
+
+#[test]
+fn generated_files_are_excluded_for_patch_input_when_repo_root_is_known() {
+    let repo = unique_dir("generated-filter-patch");
+    fs::create_dir_all(&repo).expect("repo dir should exist");
+    write_file(
+        &repo.join(".gitattributes"),
+        "gen/** linguist-generated=true\n",
+    );
+
+    let patch = single_file_patch(
+        "gen/output.go",
+        "gen/output.go",
+        &["func Build() int {", "    return 1", "}"],
+        &["func Build() int {", "    if useNewFlow() {", "        return 2", "    }", "    return 1", "}"],
+    );
+
+    let report = analyze_request(
+        &AnalyzeRequest {
+            input: AnalyzeInput::PatchText { patch },
+            repo_root: Some(repo),
+        },
+        &[&GoPlugin],
+    )
+    .expect("analysis should succeed");
+
+    assert_eq!(report.score, 0, "report was {:?}", report);
+    assert!(report.by_file.is_empty(), "by_file was {:?}", report.by_file);
+    assert!(report.reasons.is_empty(), "reasons were {:?}", report.reasons);
+}
+
+#[test]
+fn generated_file_attributes_can_be_customized_in_config() {
+    let repo = unique_dir("custom-generated-filter");
+    fs::create_dir_all(&repo).expect("repo dir should exist");
+
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.name", "Tomohiro"]);
+    git(&repo, &["config", "user.email", "tomohiro@example.com"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+
+    write_file(
+        &repo.join(".gitattributes"),
+        "gen/** pr-review-skip\nraw/** linguist-generated=true\n",
+    );
+    write_file(&repo.join("gen/output.go"), "package gen\n\nfunc Build() int {\n    return 1\n}\n");
+    write_file(&repo.join("raw/output.go"), "package raw\n\nfunc Build() int {\n    return 1\n}\n");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+
+    write_file(
+        &repo.join("gen/output.go"),
+        "package gen\n\nfunc Build() int {\n    if useNewFlow() {\n        return 2\n    }\n    return 1\n}\n",
+    );
+    write_file(
+        &repo.join("raw/output.go"),
+        "package raw\n\nfunc Build() int {\n    if useNewFlow() {\n        return 2\n    }\n    return 1\n}\n",
+    );
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "update"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let config = ScoreConfig::from_toml(
+        r#"
+schema_version = 1
+scoring_model_version = "custom-v1"
+gitattributes_skip_attributes = ["pr-review-skip"]
+
+[decision_thresholds]
+skip_review_max = 24
+review_recommended_max = 59
+
+[aggregation]
+max_score = 100
+secondary_ratio = 0.2
+secondary_cap = 12
+
+[[rules]]
+kind = "control_flow_change"
+score = 65
+"#,
+    )
+    .expect("config should parse");
+
+    let report = analyze_request_with_config(
+        &AnalyzeRequest {
+            input: AnalyzeInput::GitRevisionRange {
+                repo_root: repo.clone(),
+                base,
+                head,
+            },
+            repo_root: Some(repo),
+        },
+        &[&GoPlugin],
+        &config,
+    )
+    .expect("analysis should succeed");
+
+    assert!(
+        report.by_file.iter().all(|file| file.path != "gen/output.go"),
+        "by_file was {:?}",
+        report.by_file
+    );
+    assert!(
+        report.by_file.iter().any(|file| file.path == "raw/output.go"),
+        "by_file was {:?}",
+        report.by_file
+    );
+}
+
+#[test]
 fn semantic_change_stays_above_large_generic_change() {
     let generic_patch = single_file_patch(
         "src/lib.rs",
@@ -534,6 +702,7 @@ fn config_can_lower_public_interface_weight() {
             secondary_ratio: 0.2,
             secondary_cap: 12,
         },
+        gitattributes_skip_attributes: vec![String::from("linguist-generated")],
         rules: vec![RuleConfig {
             kind: ReasonKind::PublicInterfaceChange,
             score: 40,
@@ -566,6 +735,7 @@ fn config_can_change_decision_thresholds() {
             secondary_ratio: 0.2,
             secondary_cap: 12,
         },
+        gitattributes_skip_attributes: vec![String::from("linguist-generated")],
         rules: vec![RuleConfig {
             kind: ReasonKind::GenericCodeChange,
             score: 20,
@@ -584,6 +754,7 @@ fn score_config_parses_from_toml() {
         r#"
 schema_version = 1
 scoring_model_version = "custom-v1"
+gitattributes_skip_attributes = ["linguist-generated", "pr-review-skip"]
 
 [decision_thresholds]
 skip_review_max = 10
@@ -605,6 +776,13 @@ score = 70
     assert_eq!(config.decision_thresholds.skip_review_max, 10);
     assert_eq!(config.aggregation.max_score, 80);
     assert_eq!(config.aggregation.secondary_cap, 10);
+    assert_eq!(
+        config.gitattributes_skip_attributes,
+        vec![
+            String::from("linguist-generated"),
+            String::from("pr-review-skip")
+        ]
+    );
     assert_eq!(config.rules.len(), 1);
     assert_eq!(config.rules[0].kind, ReasonKind::ControlFlowChange);
     assert_eq!(config.rules[0].score, 70);
