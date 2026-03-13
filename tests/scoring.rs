@@ -1035,6 +1035,37 @@ score = 70
 }
 
 #[test]
+fn score_config_uses_default_skip_attributes_when_omitted() {
+    let config = ScoreConfig::from_toml(
+        r#"
+schema_version = 1
+scoring_model_version = "custom-v1"
+
+[decision_thresholds]
+skip_review_max = 10
+review_optional_max = 20
+review_suggested_max = 35
+review_recommended_max = 50
+
+[aggregation]
+max_score = 80
+secondary_ratio = 0.2
+secondary_cap = 10
+
+[[rules]]
+kind = "control_flow_change"
+score = 70
+"#,
+    )
+    .expect("config should parse");
+
+    assert_eq!(
+        config.gitattributes_skip_attributes,
+        vec![String::from("linguist-generated")]
+    );
+}
+
+#[test]
 fn go_plugin_adds_signal_for_select_statements() {
     let patch = single_file_patch(
         "internal/service.go",
