@@ -13,9 +13,16 @@ use crate::{
 static PLUGIN_TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn changed_files_with_extension(ctx: &AnalysisContext, extension: &str) -> Vec<String> {
+    changed_files_matching(ctx, |path| path.ends_with(extension))
+}
+
+pub fn changed_files_matching<F>(ctx: &AnalysisContext, mut include: F) -> Vec<String>
+where
+    F: FnMut(&str) -> bool,
+{
     ctx.files
         .iter()
-        .filter(|file| file.path.ends_with(extension))
+        .filter(|file| include(&file.path))
         .map(|file| file.path.clone())
         .collect()
 }
@@ -64,15 +71,35 @@ pub fn fallback_analysis<F>(
     extension: &str,
     fallback_kind: ReasonKind,
     reason: &str,
-    mut enrich: F,
+    enrich: F,
 ) -> PluginAnalysis
 where
     F: FnMut(&ChangedFile, &mut Vec<PluginFinding>),
 {
+    fallback_analysis_matching(
+        ctx,
+        |path| path.ends_with(extension),
+        fallback_kind,
+        reason,
+        enrich,
+    )
+}
+
+pub fn fallback_analysis_matching<Include, Enrich>(
+    ctx: &AnalysisContext,
+    mut include: Include,
+    fallback_kind: ReasonKind,
+    reason: &str,
+    mut enrich: Enrich,
+) -> PluginAnalysis
+where
+    Include: FnMut(&str) -> bool,
+    Enrich: FnMut(&ChangedFile, &mut Vec<PluginFinding>),
+{
     let mut findings = Vec::new();
 
     for file in &ctx.files {
-        if !file.path.ends_with(extension) {
+        if !include(&file.path) {
             continue;
         }
 

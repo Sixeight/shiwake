@@ -6,11 +6,15 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AnalysisContext, AnalyzerPlugin, Confidence, InputKind, PluginAnalysis, PluginFinding,
-    ReasonKind, normalized_test_oracle_lines,
+    AnalysisContext, AnalyzerPlugin, PluginAnalysis, PluginFinding, ReasonKind,
+    normalized_test_oracle_lines,
     plugins::{
-        helper_process::{EmbeddedHelper, run_embedded_json_helper},
-        support::{additive_finding, base_finding, weighted_base_finding},
+        helper_process::{
+            EmbeddedHelper, RevisionHelperFallback, resolve_revision_helper_inputs_matching,
+            run_embedded_json_helper,
+        },
+        runtime::{PackageSnapshotView, RevisionSnapshotView, analyze_revision_plugin},
+        support::{base_finding, weighted_base_finding},
     },
 };
 
@@ -36,226 +40,42 @@ impl AnalyzerPlugin for TypeScriptPlugin {
     }
 
     fn analyze(&self, ctx: &AnalysisContext) -> PluginAnalysis {
-        let ts_files = changed_typescript_files(ctx);
-        if ts_files.is_empty() {
-            return PluginAnalysis::new(Confidence::High, Vec::new());
-        }
-
-        let helper_inputs = match resolve_revision_inputs(ctx, &ts_files) {
+        let helper_inputs = match resolve_revision_helper_inputs_matching(
+            ctx,
+            is_typescript_path,
+            &["package.json"],
+            RevisionHelperFallback {
+                kind: ReasonKind::TypeScriptAnalysisFallback,
+                input_kind_reason: "typescript plugin requires git revision input",
+                before_workspace_reason: "typescript plugin requires before workspace",
+                after_workspace_reason: "typescript plugin requires after workspace",
+                required_files_reason: "typescript plugin requires package.json",
+            },
+            fallback_enrich,
+        ) {
             Ok(inputs) => inputs,
             Err(fallback) => return fallback,
         };
-
-        let before = match run_helper(&helper_inputs.before_workspace, &ts_files) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return fallback_findings(ctx, &format!("typescript helper failed: {error}"));
-            }
-        };
-        let after = match run_helper(&helper_inputs.after_workspace, &ts_files) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return fallback_findings(ctx, &format!("typescript helper failed: {error}"));
-            }
-        };
-
-        let mut findings = Vec::new();
-        let mut by_dir = HashMap::<String, String>::new();
-        for path in &ts_files {
-            let mut dir = Path::new(path)
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_string_lossy()
-                .to_string();
-            if dir.is_empty() {
-                dir = String::from(".");
-            }
-            by_dir.entry(dir).or_insert_with(|| path.clone());
-        }
-
-        for (dir, path) in &by_dir {
-            let before_exports = before
-                .packages
-                .get(dir)
-                .map(|snapshot| &snapshot.exports)
-                .cloned()
-                .unwrap_or_default();
-            let after_exports = after
-                .packages
-                .get(dir)
-                .map(|snapshot| &snapshot.exports)
-                .cloned()
-                .unwrap_or_default();
-            if before_exports != after_exports {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::TypeScriptExportedApiChange,
-                    "exported typescript api changed",
-                ));
-            }
-
-            let before_impls: HashSet<_> = before
-                .packages
-                .get(dir)
-                .map(|snapshot| snapshot.implementations.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let after_impls: HashSet<_> = after
-                .packages
-                .get(dir)
-                .map(|snapshot| snapshot.implementations.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let removed: Vec<_> = before_impls.difference(&after_impls).cloned().collect();
-            if !removed.is_empty() {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::TypeScriptInterfaceBreak,
-                    format!(
-                        "typescript interface implementation removed: {}",
-                        removed.join(", ")
-                    ),
-                ));
-            }
-        }
-
-        for path in &ts_files {
-            let before_file = before.files.get(path);
-            let after_file = after.files.get(path);
-
-            if member_kind_changed(before_file, after_file) {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::TypeScriptMemberKindChange,
-                    "typescript member kind changed",
-                ));
-            }
-            if async_changed(before_file, after_file) {
-                findings.push(weighted_base_finding(
-                    path.clone(),
-                    ReasonKind::TypeScriptAsyncChange,
-                    format!(
-                        "typescript async change (nesting {})",
-                        async_nesting(after_file)
-                    ),
-                    async_weight(after_file),
-                ));
-            }
-            if error_handling_changed(before_file, after_file) {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::TypeScriptErrorHandlingChange,
-                    "typescript error handling changed",
-                ));
-            }
-            if runtime_behavior_changed(before_file, after_file) {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::TypeScriptRuntimeBehaviorChange,
-                    "typescript runtime behavior changed",
-                ));
-            }
-            if resource_lifecycle_changed(before_file, after_file) {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::TypeScriptResourceLifecycleChange,
-                    "typescript resource lifecycle changed",
-                ));
-            }
-        }
-
-        for file in &ctx.files {
-            if !is_typescript_test_file(&file.path) {
-                continue;
-            }
-            if typescript_test_oracle_changed(file) {
-                findings.push(base_finding(
-                    file.path.clone(),
-                    ReasonKind::TypeScriptTestOracleChange,
-                    "typescript test oracle changed",
-                ));
-            }
-        }
-
-        PluginAnalysis::new(Confidence::High, findings)
-    }
-}
-
-struct RevisionInputs {
-    before_workspace: std::path::PathBuf,
-    after_workspace: std::path::PathBuf,
-}
-
-fn changed_typescript_files(ctx: &AnalysisContext) -> Vec<String> {
-    ctx.files
-        .iter()
-        .filter(|file| is_typescript_path(&file.path))
-        .map(|file| file.path.clone())
-        .collect()
-}
-
-fn resolve_revision_inputs(
-    ctx: &AnalysisContext,
-    ts_files: &[String],
-) -> Result<RevisionInputs, PluginAnalysis> {
-    if ctx.input_kind != InputKind::GitRevisionRange {
-        return Err(fallback_findings(
+        analyze_revision_plugin(
             ctx,
-            "typescript plugin requires git revision input",
-        ));
+            helper_inputs,
+            run_helper,
+            |ctx, error| fallback_findings(ctx, &format!("typescript helper failed: {error}")),
+            analyze_package_findings,
+            analyze_file_findings,
+            analyze_test_findings,
+        )
     }
-
-    let Some(before_workspace) = &ctx.before_workspace else {
-        return Err(fallback_findings(
-            ctx,
-            "typescript plugin requires before workspace",
-        ));
-    };
-    let Some(after_workspace) = &ctx.after_workspace else {
-        return Err(fallback_findings(
-            ctx,
-            "typescript plugin requires after workspace",
-        ));
-    };
-
-    if !before_workspace.join("package.json").exists()
-        || !after_workspace.join("package.json").exists()
-    {
-        return Err(fallback_findings(
-            ctx,
-            "typescript plugin requires package.json",
-        ));
-    }
-
-    if ts_files.is_empty() {
-        return Err(PluginAnalysis::new(Confidence::High, Vec::new()));
-    }
-
-    Ok(RevisionInputs {
-        before_workspace: before_workspace.clone(),
-        after_workspace: after_workspace.clone(),
-    })
 }
 
 fn fallback_findings(ctx: &AnalysisContext, reason: &str) -> PluginAnalysis {
-    let mut findings = Vec::new();
-
-    for file in &ctx.files {
-        if !is_typescript_path(&file.path) {
-            continue;
-        }
-
-        findings.push(additive_finding(
-            file.path.clone(),
-            ReasonKind::TypeScriptAnalysisFallback,
-            reason.to_string(),
-        ));
-        fallback_enrich(file, &mut findings);
-    }
-
-    PluginAnalysis::new(Confidence::Medium, findings)
+    crate::plugins::support::fallback_analysis_matching(
+        ctx,
+        is_typescript_path,
+        ReasonKind::TypeScriptAnalysisFallback,
+        reason,
+        fallback_enrich,
+    )
 }
 
 #[derive(Serialize)]
@@ -299,6 +119,29 @@ struct HelperFileSnapshot {
 struct Snapshot {
     packages: HashMap<String, HelperPackageSnapshot>,
     files: HashMap<String, HelperFileSnapshot>,
+}
+
+impl PackageSnapshotView for HelperPackageSnapshot {
+    fn exports(&self) -> &HashMap<String, String> {
+        &self.exports
+    }
+
+    fn implementations(&self) -> &[String] {
+        &self.implementations
+    }
+}
+
+impl RevisionSnapshotView for Snapshot {
+    type Package = HelperPackageSnapshot;
+    type File = HelperFileSnapshot;
+
+    fn package_snapshot(&self, dir: &str) -> Option<&Self::Package> {
+        self.packages.get(dir)
+    }
+
+    fn file_snapshot(&self, path: &str) -> Option<&Self::File> {
+        self.files.get(path)
+    }
 }
 
 fn run_helper(workspace_root: &Path, changed_files: &[String]) -> Result<Snapshot, String> {
@@ -347,6 +190,103 @@ fn fallback_enrich(file: &crate::ChangedFile, findings: &mut Vec<PluginFinding>)
             file.path.clone(),
             ReasonKind::TypeScriptExportedApiChange,
             "exported typescript api change",
+        ));
+    }
+}
+
+fn analyze_package_findings(
+    path: &str,
+    before: Option<&HelperPackageSnapshot>,
+    after: Option<&HelperPackageSnapshot>,
+    findings: &mut Vec<PluginFinding>,
+) {
+    let before_exports = before
+        .map(|snapshot| snapshot.exports.clone())
+        .unwrap_or_default();
+    let after_exports = after
+        .map(|snapshot| snapshot.exports.clone())
+        .unwrap_or_default();
+    if before_exports != after_exports {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::TypeScriptExportedApiChange,
+            "exported typescript api changed",
+        ));
+    }
+
+    let before_impls: HashSet<_> = before
+        .map(|snapshot| snapshot.implementations.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let after_impls: HashSet<_> = after
+        .map(|snapshot| snapshot.implementations.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let removed: Vec<_> = before_impls.difference(&after_impls).cloned().collect();
+    if !removed.is_empty() {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::TypeScriptInterfaceBreak,
+            format!(
+                "typescript interface implementation removed: {}",
+                removed.join(", ")
+            ),
+        ));
+    }
+}
+
+fn analyze_file_findings(
+    path: &str,
+    before: Option<&HelperFileSnapshot>,
+    after: Option<&HelperFileSnapshot>,
+    findings: &mut Vec<PluginFinding>,
+) {
+    if member_kind_changed(before, after) {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::TypeScriptMemberKindChange,
+            "typescript member kind changed",
+        ));
+    }
+    if async_changed(before, after) {
+        findings.push(weighted_base_finding(
+            path.to_string(),
+            ReasonKind::TypeScriptAsyncChange,
+            format!("typescript async change (nesting {})", async_nesting(after)),
+            async_weight(after),
+        ));
+    }
+    if error_handling_changed(before, after) {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::TypeScriptErrorHandlingChange,
+            "typescript error handling changed",
+        ));
+    }
+    if runtime_behavior_changed(before, after) {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::TypeScriptRuntimeBehaviorChange,
+            "typescript runtime behavior changed",
+        ));
+    }
+    if resource_lifecycle_changed(before, after) {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::TypeScriptResourceLifecycleChange,
+            "typescript resource lifecycle changed",
+        ));
+    }
+}
+
+fn analyze_test_findings(file: &crate::ChangedFile, findings: &mut Vec<PluginFinding>) {
+    if is_typescript_test_file(&file.path) && typescript_test_oracle_changed(file) {
+        findings.push(base_finding(
+            file.path.clone(),
+            ReasonKind::TypeScriptTestOracleChange,
+            "typescript test oracle changed",
         ));
     }
 }

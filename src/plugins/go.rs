@@ -6,12 +6,13 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AnalysisContext, AnalyzerPlugin, Confidence, PluginAnalysis, ReasonKind,
+    AnalysisContext, AnalyzerPlugin, PluginAnalysis, ReasonKind,
     plugins::{
         helper_process::{
             EmbeddedHelper, RevisionHelperFallback, resolve_revision_helper_inputs,
             run_embedded_json_helper,
         },
+        runtime::{PackageSnapshotView, RevisionSnapshotView, analyze_revision_plugin},
         support::{base_finding, fallback_analysis, weighted_base_finding},
     },
 };
@@ -60,142 +61,15 @@ impl AnalyzerPlugin for GoPlugin {
             Ok(inputs) => inputs,
             Err(fallback) => return fallback,
         };
-        let go_files = helper_inputs.changed_files;
-        if go_files.is_empty() {
-            return PluginAnalysis::new(Confidence::High, Vec::new());
-        }
-
-        let before = match run_helper(&helper_inputs.before_workspace, &go_files) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return fallback_findings(ctx, &format!("go helper failed: {error}")),
-        };
-        let after = match run_helper(&helper_inputs.after_workspace, &go_files) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return fallback_findings(ctx, &format!("go helper failed: {error}")),
-        };
-
-        let mut findings = Vec::new();
-        let mut by_dir = HashMap::<String, String>::new();
-        for path in &go_files {
-            let mut dir = Path::new(path)
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_string_lossy()
-                .to_string();
-            if dir.is_empty() {
-                dir = String::from(".");
-            }
-            by_dir.entry(dir).or_insert_with(|| path.clone());
-        }
-
-        for (dir, path) in &by_dir {
-            let before_exports = before
-                .packages
-                .get(dir)
-                .map(|snapshot| &snapshot.exports)
-                .cloned()
-                .unwrap_or_default();
-            let after_exports = after
-                .packages
-                .get(dir)
-                .map(|snapshot| &snapshot.exports)
-                .cloned()
-                .unwrap_or_default();
-            if before_exports != after_exports {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::GoExportedApiChange,
-                    "go exported api changed",
-                ));
-            }
-
-            let before_impls: HashSet<_> = before
-                .packages
-                .get(dir)
-                .map(|snapshot| snapshot.implementations.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let after_impls: HashSet<_> = after
-                .packages
-                .get(dir)
-                .map(|snapshot| snapshot.implementations.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let removed: Vec<_> = before_impls.difference(&after_impls).cloned().collect();
-            if !removed.is_empty() {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::GoInterfaceBreak,
-                    format!(
-                        "go interface implementation removed: {}",
-                        removed.join(", ")
-                    ),
-                ));
-            }
-        }
-
-        for path in &go_files {
-            let before_file = before.files.get(path);
-            let after_file = after.files.get(path);
-            if receiver_changed(before_file, after_file) {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::GoReceiverChange,
-                    "go receiver kind changed",
-                ));
-            }
-            if concurrency_changed(before_file, after_file) {
-                findings.push(weighted_base_finding(
-                    path.clone(),
-                    ReasonKind::GoConcurrencyChange,
-                    format!(
-                        "go concurrency primitive changed (nesting {})",
-                        concurrency_nesting(after_file)
-                    ),
-                    go_concurrency_weight(after_file),
-                ));
-            }
-
-            if error_handling_changed(before_file, after_file) {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::GoErrorHandlingChange,
-                    "go error handling changed",
-                ));
-            }
-
-            if runtime_behavior_changed(before_file, after_file) {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::GoRuntimeBehaviorChange,
-                    "go runtime behavior changed",
-                ));
-            }
-            if resource_lifecycle_changed(before_file, after_file) {
-                findings.push(base_finding(
-                    path.clone(),
-                    ReasonKind::GoResourceLifecycleChange,
-                    "go resource lifecycle changed",
-                ));
-            }
-        }
-
-        for file in &ctx.files {
-            if !file.path.ends_with("_test.go") {
-                continue;
-            }
-            if go_test_oracle_changed(file) {
-                findings.push(base_finding(
-                    file.path.clone(),
-                    ReasonKind::GoTestOracleChange,
-                    "go test oracle changed",
-                ));
-            }
-        }
-
-        PluginAnalysis::new(Confidence::High, findings)
+        analyze_revision_plugin(
+            ctx,
+            helper_inputs,
+            run_helper,
+            |ctx, error| fallback_findings(ctx, &format!("go helper failed: {error}")),
+            analyze_package_findings,
+            analyze_file_findings,
+            analyze_test_findings,
+        )
     }
 }
 
@@ -254,6 +128,29 @@ struct Snapshot {
     files: HashMap<String, HelperFileSnapshot>,
 }
 
+impl PackageSnapshotView for HelperPackageSnapshot {
+    fn exports(&self) -> &HashMap<String, String> {
+        &self.exports
+    }
+
+    fn implementations(&self) -> &[String] {
+        &self.implementations
+    }
+}
+
+impl RevisionSnapshotView for Snapshot {
+    type Package = HelperPackageSnapshot;
+    type File = HelperFileSnapshot;
+
+    fn package_snapshot(&self, dir: &str) -> Option<&Self::Package> {
+        self.packages.get(dir)
+    }
+
+    fn file_snapshot(&self, path: &str) -> Option<&Self::File> {
+        self.files.get(path)
+    }
+}
+
 fn run_helper(workspace_root: &Path, changed_files: &[String]) -> Result<Snapshot, String> {
     let request = HelperRequest {
         workspace_root: workspace_root.to_string_lossy().to_string(),
@@ -300,6 +197,106 @@ fn fallback_enrich(file: &crate::ChangedFile, findings: &mut Vec<crate::PluginFi
             file.path.clone(),
             ReasonKind::GoExportedApiChange,
             "exported go api change",
+        ));
+    }
+}
+
+fn analyze_package_findings(
+    path: &str,
+    before: Option<&HelperPackageSnapshot>,
+    after: Option<&HelperPackageSnapshot>,
+    findings: &mut Vec<crate::PluginFinding>,
+) {
+    let before_exports = before
+        .map(|snapshot| snapshot.exports.clone())
+        .unwrap_or_default();
+    let after_exports = after
+        .map(|snapshot| snapshot.exports.clone())
+        .unwrap_or_default();
+    if before_exports != after_exports {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::GoExportedApiChange,
+            "go exported api changed",
+        ));
+    }
+
+    let before_impls: HashSet<_> = before
+        .map(|snapshot| snapshot.implementations.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let after_impls: HashSet<_> = after
+        .map(|snapshot| snapshot.implementations.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let removed: Vec<_> = before_impls.difference(&after_impls).cloned().collect();
+    if !removed.is_empty() {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::GoInterfaceBreak,
+            format!(
+                "go interface implementation removed: {}",
+                removed.join(", ")
+            ),
+        ));
+    }
+}
+
+fn analyze_file_findings(
+    path: &str,
+    before: Option<&HelperFileSnapshot>,
+    after: Option<&HelperFileSnapshot>,
+    findings: &mut Vec<crate::PluginFinding>,
+) {
+    if receiver_changed(before, after) {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::GoReceiverChange,
+            "go receiver kind changed",
+        ));
+    }
+    if concurrency_changed(before, after) {
+        findings.push(weighted_base_finding(
+            path.to_string(),
+            ReasonKind::GoConcurrencyChange,
+            format!(
+                "go concurrency primitive changed (nesting {})",
+                concurrency_nesting(after)
+            ),
+            go_concurrency_weight(after),
+        ));
+    }
+    if error_handling_changed(before, after) {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::GoErrorHandlingChange,
+            "go error handling changed",
+        ));
+    }
+    if runtime_behavior_changed(before, after) {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::GoRuntimeBehaviorChange,
+            "go runtime behavior changed",
+        ));
+    }
+    if resource_lifecycle_changed(before, after) {
+        findings.push(base_finding(
+            path.to_string(),
+            ReasonKind::GoResourceLifecycleChange,
+            "go resource lifecycle changed",
+        ));
+    }
+}
+
+fn analyze_test_findings(file: &crate::ChangedFile, findings: &mut Vec<crate::PluginFinding>) {
+    if file.path.ends_with("_test.go") && go_test_oracle_changed(file) {
+        findings.push(base_finding(
+            file.path.clone(),
+            ReasonKind::GoTestOracleChange,
+            "go test oracle changed",
         ));
     }
 }

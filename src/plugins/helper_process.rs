@@ -9,7 +9,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{AnalysisContext, InputKind, PluginAnalysis, ReasonKind};
 
-use super::support::{fallback_analysis, unique_temp_dir};
+use super::support::unique_temp_dir;
 
 pub struct EmbeddedHelper<'a> {
     pub temp_dir_prefix: &'a str,
@@ -88,7 +88,27 @@ pub fn resolve_revision_helper_inputs<F>(
 where
     F: FnMut(&crate::ChangedFile, &mut Vec<crate::PluginFinding>),
 {
-    let changed_files = super::support::changed_files_with_extension(ctx, extension);
+    resolve_revision_helper_inputs_matching(
+        ctx,
+        |path| path.ends_with(extension),
+        required_files,
+        fallback,
+        enrich,
+    )
+}
+
+pub fn resolve_revision_helper_inputs_matching<Include, Enrich>(
+    ctx: &AnalysisContext,
+    include: Include,
+    required_files: &[&str],
+    fallback: RevisionHelperFallback<'_>,
+    enrich: Enrich,
+) -> Result<RevisionHelperInputs, PluginAnalysis>
+where
+    Include: Copy + Fn(&str) -> bool,
+    Enrich: FnMut(&crate::ChangedFile, &mut Vec<crate::PluginFinding>),
+{
+    let changed_files = super::support::changed_files_matching(ctx, include);
     if changed_files.is_empty() {
         return Ok(RevisionHelperInputs {
             changed_files,
@@ -98,9 +118,9 @@ where
     }
 
     if ctx.input_kind != InputKind::GitRevisionRange {
-        return Err(fallback_analysis(
+        return Err(super::support::fallback_analysis_matching(
             ctx,
-            extension,
+            include,
             fallback.kind.clone(),
             fallback.input_kind_reason,
             enrich,
@@ -108,18 +128,18 @@ where
     }
 
     let Some(before_workspace) = &ctx.before_workspace else {
-        return Err(fallback_analysis(
+        return Err(super::support::fallback_analysis_matching(
             ctx,
-            extension,
+            include,
             fallback.kind.clone(),
             fallback.before_workspace_reason,
             enrich,
         ));
     };
     let Some(after_workspace) = &ctx.after_workspace else {
-        return Err(fallback_analysis(
+        return Err(super::support::fallback_analysis_matching(
             ctx,
-            extension,
+            include,
             fallback.kind.clone(),
             fallback.after_workspace_reason,
             enrich,
@@ -133,9 +153,9 @@ where
             .iter()
             .any(|path| !after_workspace.join(path).exists())
     {
-        return Err(fallback_analysis(
+        return Err(super::support::fallback_analysis_matching(
             ctx,
-            extension,
+            include,
             fallback.kind,
             fallback.required_files_reason,
             enrich,
