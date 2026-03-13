@@ -226,6 +226,81 @@ fn larger_patch_scores_higher_than_small_patch() {
 }
 
 #[test]
+fn large_generic_patch_stays_skip_review() {
+    let patch = single_file_patch(
+        ".github/workflows/ci.yaml",
+        ".github/workflows/ci.yaml",
+        &["timeout-minutes: 10"],
+        &[
+            "timeout-minutes: 20",
+            "concurrency:",
+            "  group: ci-${{ github.ref }}",
+            "  cancel-in-progress: true",
+            "permissions:",
+            "  contents: read",
+            "  pull-requests: write",
+            "env:",
+            "  FOO: bar",
+            "  BAZ: qux",
+            "  ENABLE_CACHE: true",
+            "  RETRY_COUNT: 3",
+        ],
+    );
+
+    let report = analyze_patch(&patch, &[]).expect("analysis should succeed");
+
+    assert!(report.score <= 24, "report was {:?}", report);
+    assert_eq!(report.decision.as_str(), "skip_review");
+}
+
+#[test]
+fn multiple_generic_files_stay_skip_review() {
+    let patch = format!(
+        "{}{}",
+        single_file_patch(
+            "infra/a.tf",
+            "infra/a.tf",
+            &["enabled = false"],
+            &[
+                "enabled = true",
+                "labels = {",
+                "  env = \"prod\"",
+                "  team = \"platform\"",
+                "  service = \"db\"",
+                "}",
+                "timeouts = {",
+                "  create = \"30m\"",
+                "}",
+                "retries = 3",
+                "region = \"asia-northeast1\"",
+            ],
+        ),
+        single_file_patch(
+            "infra/b.tf",
+            "infra/b.tf",
+            &["enabled = false"],
+            &[
+                "enabled = true",
+                "labels = {",
+                "  env = \"prod\"",
+                "  team = \"platform\"",
+                "}",
+                "timeouts = {",
+                "  create = \"30m\"",
+                "}",
+                "retries = 3",
+                "region = \"asia-northeast1\"",
+            ],
+        ),
+    );
+
+    let report = analyze_patch(&patch, &[]).expect("analysis should succeed");
+
+    assert!(report.score <= 24, "report was {:?}", report);
+    assert_eq!(report.decision.as_str(), "skip_review");
+}
+
+#[test]
 fn revision_range_adds_repo_hotspot_signal_for_frequently_touched_file() {
     let repo = unique_dir("history-score");
     fs::create_dir_all(&repo).expect("repo dir should exist");
@@ -564,6 +639,56 @@ score = 65
         "by_file was {:?}",
         report.by_file
     );
+}
+
+#[test]
+fn medium_semantic_change_with_hotspot_stays_recommended() {
+    let repo = unique_dir("history-medium-semantic");
+    fs::create_dir_all(&repo).expect("repo dir should exist");
+
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.name", "Tomohiro"]);
+    git(&repo, &["config", "user.email", "tomohiro@example.com"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+
+    write_file(&repo.join("src/hot.rs"), "pub fn hot() -> i32 {\n    1\n}\n");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+
+    for value in ["2", "3", "4", "5", "6", "7", "8", "9"] {
+        write_file(
+            &repo.join("src/hot.rs"),
+            &format!("pub fn hot() -> i32 {{\n    {value}\n}}\n"),
+        );
+        git(&repo, &["add", "src/hot.rs"]);
+        git(&repo, &["commit", "-m", "touch hot"]);
+    }
+
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+
+    write_file(
+        &repo.join("src/hot.rs"),
+        "pub fn hot() -> i32 {\n    let mut value = 0;\n    if should_use_override() {\n        value = compute_override();\n    }\n    value\n}\n",
+    );
+    git(&repo, &["add", "src/hot.rs"]);
+    git(&repo, &["commit", "-m", "semantic change"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let report = analyze_request(
+        &AnalyzeRequest {
+            input: AnalyzeInput::GitRevisionRange {
+                repo_root: repo.clone(),
+                base,
+                head,
+            },
+            repo_root: Some(repo),
+        },
+        &[],
+    )
+    .expect("analysis should succeed");
+
+    assert!(report.score < 60, "report was {:?}", report);
+    assert_eq!(report.decision.as_str(), "review_recommended");
 }
 
 #[test]

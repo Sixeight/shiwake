@@ -454,6 +454,7 @@ struct FileScoreState {
     size_modifier: u32,
     hotspot_modifier: u32,
     plugin_contribution: u32,
+    has_semantic_risk: bool,
     score: u32,
 }
 
@@ -966,6 +967,7 @@ fn score_file(
         size_modifier,
         hotspot_modifier,
         plugin_contribution: 0,
+        has_semantic_risk: base.has_semantic_risk,
         score,
     }
 }
@@ -983,6 +985,7 @@ fn comment_only_score(file: &ChangedFile, reasons: &mut Vec<Reason>, config: &Sc
         size_modifier: 0,
         hotspot_modifier: 0,
         plugin_contribution: 0,
+        has_semantic_risk: false,
         score,
     }
 }
@@ -1102,6 +1105,11 @@ fn compute_size_modifier(
     let Some(rule_score) = change_size_weight(file, config) else {
         return 0;
     };
+    let rule_score = if base.has_semantic_risk {
+        rule_score
+    } else {
+        rule_score.div_ceil(3)
+    };
     let size_modifier = rule_score.min(modifier_cap);
     if size_modifier == 0 {
         return 0;
@@ -1157,14 +1165,19 @@ fn aggregate_scores(scores: &[FileScoreState], config: &AggregationConfig) -> (u
     sorted.sort_unstable_by(|left, right| right.score.cmp(&left.score));
 
     let top_score = sorted.first().map(|file| file.score).unwrap_or_default();
+    let has_semantic_risk = sorted.iter().any(|file| file.has_semantic_risk);
     let secondary_raw: u32 = sorted
         .iter()
         .skip(1)
         .map(|file| file.score.min(30))
         .sum();
-    let secondary_contribution = ((secondary_raw as f64) * config.secondary_ratio)
-        .round()
-        .min(config.secondary_cap as f64) as u32;
+    let secondary_contribution = if has_semantic_risk {
+        ((secondary_raw as f64) * config.secondary_ratio)
+            .round()
+            .min(config.secondary_cap as f64) as u32
+    } else {
+        0
+    };
 
     (
         top_score
