@@ -83,11 +83,13 @@ This mode opens the repository with `git2`, generates a patch between two revisi
 
 ```bash
 cargo run -- --repo . --base HEAD~1 --head HEAD --plugin go
+cargo run -- --repo . --base HEAD~1 --head HEAD --plugin ts
 ```
 
 Current built-in plugin IDs:
 
 - `go`
+- `ts`
 
 The Go plugin can use repository revisions for higher-precision checks such as:
 
@@ -96,6 +98,14 @@ The Go plugin can use repository revisions for higher-precision checks such as:
 - concurrency and runtime behavior changes
 - error-handling and resource-lifecycle changes
 - Go test-oracle changes such as `cmp.Diff`, `assert`, `require`, and `t.Fatal`
+
+The TypeScript plugin can use repository revisions for higher-precision checks such as:
+
+- exported API and interface break detection, including relative-imported interfaces and simple type aliases
+- member kind changes such as method-to-property flips
+- async and runtime behavior changes such as `async`/`await`, `Promise`, timers, and retry markers
+- error-handling and resource-lifecycle changes
+- TypeScript test-oracle changes such as `expect(...).toBe(...)`
 
 ## Score Configuration
 
@@ -204,6 +214,15 @@ This keeps semantic risk as the main driver while letting patch size and repo hi
 - `go_runtime_behavior_change`: Go time, retry, or context-driven runtime behavior changed
 - `go_resource_lifecycle_change`: Go cleanup and resource lifecycle handling changed
 - `go_analysis_fallback`: Go plugin could not run high-precision analysis and fell back
+- `typescript_exported_api_change`: TypeScript exported API changed
+- `typescript_interface_break`: TypeScript class no longer satisfies an interface or object-like type alias
+- `typescript_async_change`: TypeScript async, await, promise, or timer behavior changed
+- `typescript_error_handling_change`: TypeScript try/catch/throw or error narrowing changed
+- `typescript_member_kind_change`: TypeScript class member kind changed
+- `typescript_test_oracle_change`: TypeScript test oracle or expectation logic changed
+- `typescript_runtime_behavior_change`: TypeScript time, retry, or runtime behavior changed
+- `typescript_resource_lifecycle_change`: TypeScript cleanup or abort lifecycle handling changed
+- `typescript_analysis_fallback`: TypeScript plugin could not run high-precision analysis and fell back
 
 ### Per-File Breakdown
 

@@ -9,6 +9,7 @@ use shiwake::{
     AnalysisContext, AnalyzeInput, AnalyzeRequest, AnalyzerPlugin, Confidence, PluginAnalysis,
     PluginFinding, PluginScoreMode, ReasonKind, RuleConfig, ScoreConfig, analyze_patch,
     analyze_patch_with_config, analyze_request, analyze_request_with_config, plugins::go::GoPlugin,
+    plugins::typescript::TypeScriptPlugin,
 };
 
 fn single_file_patch(old_path: &str, new_path: &str, removed: &[&str], added: &[&str]) -> String {
@@ -1082,6 +1083,52 @@ fn go_plugin_adds_signal_for_exported_api_changes() {
             .any(|reason| reason.kind == ReasonKind::GoExportedApiChange
                 && reason.message.contains("exported go api")),
     );
+    assert_eq!(report.confidence.as_str(), "medium");
+    assert!(report.score >= 70, "score was {}", report.score);
+}
+
+#[test]
+fn typescript_plugin_adds_signal_for_async_changes() {
+    let patch = single_file_patch(
+        "src/service.ts",
+        "src/service.ts",
+        &["export function run(): number {", "  return work()", "}"],
+        &[
+            "export async function run(signal?: AbortSignal): Promise<number> {",
+            "  return await work(signal)",
+            "}",
+        ],
+    );
+
+    let plugin = TypeScriptPlugin::new();
+    let report = analyze_patch(&patch, &[&plugin]).expect("analysis should succeed");
+
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == ReasonKind::TypeScriptAsyncChange
+                && reason.message.contains("typescript async")),
+    );
+    assert_eq!(report.confidence.as_str(), "medium");
+    assert!(report.score >= 60, "score was {}", report.score);
+}
+
+#[test]
+fn typescript_plugin_adds_signal_for_exported_api_changes() {
+    let patch = single_file_patch(
+        "src/api.ts",
+        "src/api.ts",
+        &["export function build(id: string): Result {"],
+        &["export function build(id: string, strict: boolean): Result {"],
+    );
+
+    let plugin = TypeScriptPlugin::new();
+    let report = analyze_patch(&patch, &[&plugin]).expect("analysis should succeed");
+
+    assert!(report.reasons.iter().any(|reason| reason.kind
+        == ReasonKind::TypeScriptExportedApiChange
+        && reason.message.contains("exported typescript api")),);
     assert_eq!(report.confidence.as_str(), "medium");
     assert!(report.score >= 70, "score was {}", report.score);
 }

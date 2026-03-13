@@ -123,6 +123,24 @@ pub enum ReasonKind {
     GoRuntimeBehaviorChange,
     GoResourceLifecycleChange,
     GoAnalysisFallback,
+    #[serde(rename = "typescript_exported_api_change")]
+    TypeScriptExportedApiChange,
+    #[serde(rename = "typescript_interface_break")]
+    TypeScriptInterfaceBreak,
+    #[serde(rename = "typescript_async_change")]
+    TypeScriptAsyncChange,
+    #[serde(rename = "typescript_error_handling_change")]
+    TypeScriptErrorHandlingChange,
+    #[serde(rename = "typescript_member_kind_change")]
+    TypeScriptMemberKindChange,
+    #[serde(rename = "typescript_test_oracle_change")]
+    TypeScriptTestOracleChange,
+    #[serde(rename = "typescript_runtime_behavior_change")]
+    TypeScriptRuntimeBehaviorChange,
+    #[serde(rename = "typescript_resource_lifecycle_change")]
+    TypeScriptResourceLifecycleChange,
+    #[serde(rename = "typescript_analysis_fallback")]
+    TypeScriptAnalysisFallback,
 }
 
 impl ReasonKind {
@@ -260,6 +278,42 @@ impl ScoreConfig {
                 },
                 RuleConfig {
                     kind: ReasonKind::GoAnalysisFallback,
+                    score: 0,
+                },
+                RuleConfig {
+                    kind: ReasonKind::TypeScriptExportedApiChange,
+                    score: 25,
+                },
+                RuleConfig {
+                    kind: ReasonKind::TypeScriptInterfaceBreak,
+                    score: 30,
+                },
+                RuleConfig {
+                    kind: ReasonKind::TypeScriptAsyncChange,
+                    score: 20,
+                },
+                RuleConfig {
+                    kind: ReasonKind::TypeScriptErrorHandlingChange,
+                    score: 25,
+                },
+                RuleConfig {
+                    kind: ReasonKind::TypeScriptMemberKindChange,
+                    score: 25,
+                },
+                RuleConfig {
+                    kind: ReasonKind::TypeScriptTestOracleChange,
+                    score: 30,
+                },
+                RuleConfig {
+                    kind: ReasonKind::TypeScriptRuntimeBehaviorChange,
+                    score: 25,
+                },
+                RuleConfig {
+                    kind: ReasonKind::TypeScriptResourceLifecycleChange,
+                    score: 25,
+                },
+                RuleConfig {
+                    kind: ReasonKind::TypeScriptAnalysisFallback,
                     score: 0,
                 },
             ],
@@ -1753,6 +1807,7 @@ pub fn resolve_builtin_plugins(
     for name in names {
         match name.as_str() {
             "go" => plugins.push(Box::new(plugins::go::GoPlugin::new())),
+            "ts" => plugins.push(Box::new(plugins::typescript::TypeScriptPlugin::new())),
             unknown => {
                 return Err(AnalyzeError::Command(format!("unknown plugin: {unknown}")));
             }
