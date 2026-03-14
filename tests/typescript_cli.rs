@@ -45,6 +45,19 @@ fn write_file(path: &Path, contents: &str) {
     fs::write(path, contents).expect("file should be written");
 }
 
+fn large_unrelated_files() -> Vec<(String, String)> {
+    (0..12_000)
+        .map(|index| {
+            (
+                format!(
+                    "docs/generated/really-long-directory-name-{index:05}/artifact-{index:05}-for-buffer-pressure.txt"
+                ),
+                String::from("generated\n"),
+            )
+        })
+        .collect()
+}
+
 fn init_typescript_repo(
     name: &str,
     initial_files: &[(&str, &str)],
@@ -709,6 +722,79 @@ fn typescript_plugin_detects_resource_lifecycle_change() {
 
     assert!(
         output.contains("\"kind\":\"typescript_resource_lifecycle_change\""),
+        "stdout was {output}"
+    );
+}
+
+#[test]
+fn typescript_plugin_avoids_fallback_with_many_unrelated_files() {
+    let initial = r#"export interface Runner {
+  run(id: string): Promise<void>
+}
+
+export class Worker implements Runner {
+  async run(id: string): Promise<void> {
+    void id
+  }
+}
+"#;
+    let updated = r#"export interface Runner {
+  run(id: string): Promise<void>
+}
+
+export class Worker implements Runner {
+  async run(id: string, strict: boolean): Promise<void> {
+    void id
+    void strict
+  }
+}
+"#;
+    let repo = unique_dir("ts-many-unrelated");
+    fs::create_dir_all(&repo).expect("repo dir should exist");
+
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.name", "Tomohiro"]);
+    git(&repo, &["config", "user.email", "tomohiro@example.com"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    write_file(
+        &repo.join("package.json"),
+        "{\n  \"name\": \"shiwake-ts-test\",\n  \"private\": true,\n  \"type\": \"module\"\n}\n",
+    );
+    write_file(&repo.join("src/api.ts"), initial);
+    for (path, contents) in large_unrelated_files() {
+        write_file(&repo.join(path), &contents);
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+
+    write_file(&repo.join("src/api.ts"), updated);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "update"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let assert = Command::cargo_bin("shiwake")
+        .expect("binary should build")
+        .args([
+            "--repo",
+            repo.to_str().expect("repo path should be utf8"),
+            "--base",
+            &base,
+            "--head",
+            &head,
+            "--plugin",
+            "ts",
+        ])
+        .assert();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+
+    assert!(
+        !output.contains("\"kind\":\"typescript_analysis_fallback\""),
+        "stdout was {output}"
+    );
+    assert!(
+        output.contains("\"kind\":\"typescript_interface_break\""),
         "stdout was {output}"
     );
 }

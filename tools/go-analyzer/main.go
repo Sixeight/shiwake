@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"hash/fnv"
 	"go/ast"
 	"go/format"
 	"go/parser"
@@ -10,6 +13,7 @@ import (
 	"go/types"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -18,11 +22,18 @@ import (
 )
 
 type helperRequest struct {
-	WorkspaceRoot string   `json:"workspace_root"`
-	ChangedFiles  []string `json:"changed_files"`
+	RepoRoot    string   `json:"repo_root"`
+	BaseRev     string   `json:"base_rev"`
+	HeadRev     string   `json:"head_rev"`
+	ChangedFiles []string `json:"changed_files"`
 }
 
 type helperResponse struct {
+	Before revisionSnapshot `json:"before"`
+	After  revisionSnapshot `json:"after"`
+}
+
+type revisionSnapshot struct {
 	Packages []packageSnapshot `json:"packages"`
 	Files    []fileSnapshot    `json:"files"`
 }
@@ -59,23 +70,301 @@ func main() {
 		fail(err)
 	}
 
-	dirs := changedDirs(request.ChangedFiles)
-	response := helperResponse{
+	before, err := analyzeRevision(request.RepoRoot, request.BaseRev, request.ChangedFiles)
+	if err != nil {
+		fail(err)
+	}
+	after, err := analyzeRevision(request.RepoRoot, request.HeadRev, request.ChangedFiles)
+	if err != nil {
+		fail(err)
+	}
+
+	response := helperResponse{Before: before, After: after}
+
+	if err := json.NewEncoder(os.Stdout).Encode(response); err != nil {
+		fail(err)
+	}
+}
+
+func analyzeRevision(repoRoot, rev string, changedFiles []string) (revisionSnapshot, error) {
+	workspaceRoot, err := materializeRevision(repoRoot, rev, changedFiles)
+	if err != nil {
+		return revisionSnapshot{}, err
+	}
+
+	dirs := changedDirs(changedFiles)
+	response := revisionSnapshot{
 		Packages: []packageSnapshot{},
 		Files:    []fileSnapshot{},
 	}
 	for _, dir := range dirs {
-		pkgSnapshot, fileSnapshots, err := analyzePackage(request.WorkspaceRoot, dir, request.ChangedFiles)
+		pkgSnapshot, fileSnapshots, err := analyzePackage(workspaceRoot, dir, changedFiles)
 		if err != nil {
-			fail(err)
+			return revisionSnapshot{}, err
 		}
 		response.Packages = append(response.Packages, pkgSnapshot)
 		response.Files = append(response.Files, fileSnapshots...)
 	}
 
-	if err := json.NewEncoder(os.Stdout).Encode(response); err != nil {
-		fail(err)
+	return response, nil
+}
+
+func materializeRevision(repoRoot, rev string, changedFiles []string) (string, error) {
+	cacheDir := cachedRevisionDir(repoRoot, rev, changedFiles)
+	if _, err := os.Stat(cacheDir); err == nil {
+		return cacheDir, nil
 	}
+
+	tempDir, err := os.MkdirTemp("", "shiwake-go-rev-*")
+	if err != nil {
+		return "", err
+	}
+
+	modulePath := ""
+	rootFiles, err := gitShowBatch(repoRoot, rev, []string{"go.mod", "go.sum"})
+	if err != nil {
+		_ = os.RemoveAll(tempDir)
+		return "", err
+	}
+	if goMod := rootFiles["go.mod"]; goMod != nil {
+		modulePath = modulePathFromGoMod(string(goMod))
+		if err := writeFileContents(tempDir, "go.mod", goMod); err != nil {
+			_ = os.RemoveAll(tempDir)
+			return "", err
+		}
+	}
+	if goSum := rootFiles["go.sum"]; goSum != nil {
+		if err := writeFileContents(tempDir, "go.sum", goSum); err != nil {
+			_ = os.RemoveAll(tempDir)
+			return "", err
+		}
+	}
+
+	seenDirs := map[string]struct{}{}
+	queue := append([]string{}, changedDirs(changedFiles)...)
+	for len(queue) > 0 {
+		dir := queue[0]
+		queue = queue[1:]
+		if _, ok := seenDirs[dir]; ok {
+			continue
+		}
+		seenDirs[dir] = struct{}{}
+
+		paths, err := revisionFilesInDir(repoRoot, rev, dir)
+		if err != nil {
+			_ = os.RemoveAll(tempDir)
+			return "", err
+		}
+		contents, err := gitShowBatch(repoRoot, rev, paths)
+		if err != nil {
+			_ = os.RemoveAll(tempDir)
+			return "", err
+		}
+		for _, file := range paths {
+			content := contents[file]
+			if content == nil {
+				continue
+			}
+			if err := writeFileContents(tempDir, file, content); err != nil {
+				_ = os.RemoveAll(tempDir)
+				return "", err
+			}
+			for _, importDir := range localImportDirsFromSource(content, modulePath) {
+				if _, ok := seenDirs[importDir]; !ok {
+					queue = append(queue, importDir)
+				}
+			}
+		}
+	}
+
+	if err := os.Rename(tempDir, cacheDir); err != nil {
+		if _, statErr := os.Stat(cacheDir); statErr == nil {
+			_ = os.RemoveAll(tempDir)
+			return cacheDir, nil
+		}
+		_ = os.RemoveAll(tempDir)
+		return "", err
+	}
+
+	return cacheDir, nil
+}
+
+func cachedRevisionDir(repoRoot, rev string, changedFiles []string) string {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(repoRoot))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write([]byte(rev))
+	_, _ = hasher.Write([]byte{0})
+	for _, path := range changedFiles {
+		_, _ = hasher.Write([]byte(path))
+		_, _ = hasher.Write([]byte{0})
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("shiwake-go-rev-%x", hasher.Sum64()))
+}
+
+func revisionFilesInDir(repoRoot, rev, dir string) ([]string, error) {
+	args := []string{"-C", repoRoot, "ls-tree", "-r", "--name-only", rev}
+	if dir != "." {
+		args = append(args, "--", dir)
+	}
+	output, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return nil, err
+	}
+
+	files := []string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasSuffix(line, ".go") || strings.HasSuffix(line, "_test.go") {
+			continue
+		}
+		if filepath.Dir(line) != dir {
+			continue
+		}
+		files = append(files, line)
+	}
+
+	sort.Strings(files)
+	return files, nil
+}
+
+func writeFileContents(destRoot, relativePath string, content []byte) error {
+	target := filepath.Join(destRoot, relativePath)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(target, content, 0o644)
+}
+
+func gitShowBatch(repoRoot, rev string, paths []string) (map[string][]byte, error) {
+	results := make(map[string][]byte, len(paths))
+	if len(paths) == 0 {
+		return results, nil
+	}
+
+	cmd := exec.Command("git", "-C", repoRoot, "cat-file", "--batch")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	go func() {
+		for _, relativePath := range paths {
+			_, _ = fmt.Fprintf(stdin, "%s:%s\n", rev, relativePath)
+		}
+		_ = stdin.Close()
+	}()
+
+	reader := bufio.NewReader(stdout)
+	for _, relativePath := range paths {
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			_ = cmd.Wait()
+			return nil, err
+		}
+		header = strings.TrimSpace(header)
+		if strings.HasSuffix(header, " missing") {
+			results[relativePath] = nil
+			continue
+		}
+
+		var objectID string
+		var objectType string
+		var size int
+		if _, err := fmt.Sscanf(header, "%s %s %d", &objectID, &objectType, &size); err != nil {
+			_ = cmd.Wait()
+			return nil, fmt.Errorf("unexpected git cat-file header: %s", header)
+		}
+
+		content := make([]byte, size)
+		if _, err := io.ReadFull(reader, content); err != nil {
+			_ = cmd.Wait()
+			return nil, err
+		}
+		if _, err := reader.ReadByte(); err != nil {
+			_ = cmd.Wait()
+			return nil, err
+		}
+		results[relativePath] = content
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(stderr.String()))
+	}
+
+	return results, nil
+}
+
+func gitShow(repoRoot, rev, relativePath string) ([]byte, error) {
+	results, err := gitShowBatch(repoRoot, rev, []string{relativePath})
+	if err != nil {
+		return nil, err
+	}
+	content := results[relativePath]
+	if content == nil {
+		return nil, fmt.Errorf("path %s missing at %s", relativePath, rev)
+	}
+	return content, nil
+}
+
+func isMissingObject(err error) bool {
+	return strings.Contains(err.Error(), "exists on disk, but not in") ||
+		strings.Contains(err.Error(), "pathspec") ||
+		strings.Contains(err.Error(), "does not exist")
+}
+
+func modulePathFromGoMod(contents string) string {
+	for _, line := range strings.Split(contents, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "module ") {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, "module "))
+		}
+	}
+
+	return ""
+}
+
+func localImportDirsFromSource(source []byte, modulePath string) []string {
+	if modulePath == "" {
+		return nil
+	}
+
+	file, err := parser.ParseFile(token.NewFileSet(), "", source, parser.ImportsOnly)
+	if err != nil {
+		return nil
+	}
+
+	dirs := map[string]struct{}{}
+	for _, spec := range file.Imports {
+		importPath := strings.Trim(spec.Path.Value, "\"")
+		switch {
+		case importPath == modulePath:
+			dirs["."] = struct{}{}
+		case strings.HasPrefix(importPath, modulePath+"/"):
+			dir := strings.TrimPrefix(importPath, modulePath+"/")
+			if dir == "" {
+				dir = "."
+			}
+			dirs[dir] = struct{}{}
+		}
+	}
+
+	paths := make([]string, 0, len(dirs))
+	for dir := range dirs {
+		paths = append(paths, dir)
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 func changedDirs(paths []string) []string {

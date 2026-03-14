@@ -3,8 +3,6 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use git2::{Repository, Tree};
@@ -12,7 +10,6 @@ use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
 const SCORING_MODEL_VERSION: &str = "v1";
-static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub mod plugins;
 
@@ -424,8 +421,6 @@ pub struct AnalysisContext {
     pub repo_root: Option<PathBuf>,
     pub base_rev: Option<String>,
     pub head_rev: Option<String>,
-    pub before_workspace: Option<PathBuf>,
-    pub after_workspace: Option<PathBuf>,
     pub files: Vec<ChangedFile>,
 }
 
@@ -655,8 +650,6 @@ fn build_context(
                     repo_root: request.repo_root.clone(),
                     base_rev: None,
                     head_rev: None,
-                    before_workspace: None,
-                    after_workspace: None,
                     files,
                 },
                 WorkspaceGuard { paths: Vec::new() },
@@ -696,24 +689,15 @@ fn build_git_revision_context(
         file.history = Some(read_file_history(repo_root, base, &file.path)?);
     }
 
-    let before_workspace = unique_temp_dir("go-before");
-    let after_workspace = unique_temp_dir("go-after");
-    export_tree(&repo, &base_tree, &before_workspace)?;
-    export_tree(&repo, &head_tree, &after_workspace)?;
-
     Ok((
         AnalysisContext {
             input_kind: InputKind::GitRevisionRange,
             repo_root: Some(repo_root.to_path_buf()),
             base_rev: Some(base.to_string()),
             head_rev: Some(head.to_string()),
-            before_workspace: Some(before_workspace.clone()),
-            after_workspace: Some(after_workspace.clone()),
             files,
         },
-        WorkspaceGuard {
-            paths: vec![before_workspace, after_workspace],
-        },
+        WorkspaceGuard { paths: Vec::new() },
     ))
 }
 
@@ -762,54 +746,6 @@ fn read_blob_text(
     let object = entry.to_object(repo)?;
     let blob = object.peel_to_blob()?;
     Ok(String::from_utf8(blob.content().to_vec()).ok())
-}
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should move forward")
-        .as_nanos();
-    let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "shiwake-{prefix}-{}-{nanos}-{counter}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).expect("temp directory should be created");
-    path
-}
-
-fn export_tree(repo: &Repository, tree: &Tree<'_>, dest: &Path) -> Result<(), AnalyzeError> {
-    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        let Some(name) = entry.name() else {
-            return git2::TreeWalkResult::Ok;
-        };
-
-        let relative = if root.is_empty() {
-            PathBuf::from(name)
-        } else {
-            Path::new(root).join(name)
-        };
-        let target = dest.join(&relative);
-
-        match entry.kind() {
-            Some(git2::ObjectType::Tree) => {
-                let _ = fs::create_dir_all(&target);
-            }
-            Some(git2::ObjectType::Blob) => {
-                if let Some(parent) = target.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                if let Ok(blob) = repo.find_blob(entry.id()) {
-                    let _ = fs::write(&target, blob.content());
-                }
-            }
-            _ => {}
-        }
-
-        git2::TreeWalkResult::Ok
-    })?;
-
-    Ok(())
 }
 
 fn filter_generated_files(

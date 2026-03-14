@@ -28,7 +28,7 @@ pub fn analyze_revision_plugin<S, RunHelper, Fallback, AnalyzePackage, AnalyzeFi
 ) -> PluginAnalysis
 where
     S: RevisionSnapshotView,
-    RunHelper: Fn(&Path, &[String]) -> Result<S, String>,
+    RunHelper: Fn(&RevisionHelperInputs) -> Result<(S, S), String>,
     Fallback: Fn(&AnalysisContext, &str) -> PluginAnalysis,
     AnalyzePackage: Fn(&str, Option<&S::Package>, Option<&S::Package>, &mut Vec<PluginFinding>),
     AnalyzeFile: Fn(&str, Option<&S::File>, Option<&S::File>, &mut Vec<PluginFinding>),
@@ -38,15 +38,8 @@ where
         return PluginAnalysis::new(Confidence::High, Vec::new());
     }
 
-    let before = match run_helper(
-        &helper_inputs.before_workspace,
-        &helper_inputs.changed_files,
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return fallback_findings(ctx, &error),
-    };
-    let after = match run_helper(&helper_inputs.after_workspace, &helper_inputs.changed_files) {
-        Ok(snapshot) => snapshot,
+    let (before, after) = match run_helper(&helper_inputs) {
+        Ok(snapshots) => snapshots,
         Err(error) => return fallback_findings(ctx, &error),
     };
 
@@ -101,7 +94,7 @@ fn representative_paths_by_dir(paths: &[String]) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::Path};
+    use std::collections::HashMap;
 
     use crate::{
         AnalysisContext, ChangedFile, Confidence, InputKind, PluginAnalysis, PluginFinding,
@@ -158,8 +151,6 @@ mod tests {
             repo_root: None,
             base_rev: None,
             head_rev: None,
-            before_workspace: None,
-            after_workspace: None,
             files: vec![
                 ChangedFile {
                     path: String::from("pkg/api.go"),
@@ -185,39 +176,42 @@ mod tests {
         };
         let helper_inputs = RevisionHelperInputs {
             changed_files: vec![String::from("pkg/api.go")],
-            before_workspace: Path::new("before").to_path_buf(),
-            after_workspace: Path::new("after").to_path_buf(),
+            repo_root: std::path::Path::new("repo").to_path_buf(),
+            base_rev: String::from("before"),
+            head_rev: String::from("after"),
         };
 
         let report = analyze_revision_plugin(
             &ctx,
             helper_inputs,
-            |workspace, changed_files| {
-                let is_before = workspace == Path::new("before");
-                let mut packages = HashMap::new();
-                let mut files = HashMap::new();
-                packages.insert(
-                    String::from("pkg"),
-                    PackageSnapshot {
-                        exports: if is_before {
-                            HashMap::from([(String::from("Before"), String::from("func()"))])
-                        } else {
-                            HashMap::from([(String::from("After"), String::from("func()"))])
+            |inputs| {
+                let build_snapshot = |is_before: bool| {
+                    let mut packages = HashMap::new();
+                    let mut files = HashMap::new();
+                    packages.insert(
+                        String::from("pkg"),
+                        PackageSnapshot {
+                            exports: if is_before {
+                                HashMap::from([(String::from("Before"), String::from("func()"))])
+                            } else {
+                                HashMap::from([(String::from("After"), String::from("func()"))])
+                            },
+                            implementations: if is_before {
+                                vec![String::from("OldImpl")]
+                            } else {
+                                vec![]
+                            },
                         },
-                        implementations: if is_before {
-                            vec![String::from("OldImpl")]
-                        } else {
-                            vec![]
+                    );
+                    files.insert(
+                        inputs.changed_files[0].clone(),
+                        FileSnapshot {
+                            counter: if is_before { 1 } else { 2 },
                         },
-                    },
-                );
-                files.insert(
-                    changed_files[0].clone(),
-                    FileSnapshot {
-                        counter: if is_before { 1 } else { 2 },
-                    },
-                );
-                Ok(Snapshot { packages, files })
+                    );
+                    Snapshot { packages, files }
+                };
+                Ok((build_snapshot(true), build_snapshot(false)))
             },
             |_, reason| {
                 PluginAnalysis::new(
@@ -309,8 +303,6 @@ mod tests {
             repo_root: None,
             base_rev: None,
             head_rev: None,
-            before_workspace: None,
-            after_workspace: None,
             files: vec![ChangedFile {
                 path: String::from("pkg/api.go"),
                 old_path: None,
@@ -324,14 +316,15 @@ mod tests {
         };
         let helper_inputs = RevisionHelperInputs {
             changed_files: vec![String::from("pkg/api.go")],
-            before_workspace: Path::new("before").to_path_buf(),
-            after_workspace: Path::new("after").to_path_buf(),
+            repo_root: std::path::Path::new("repo").to_path_buf(),
+            base_rev: String::from("before"),
+            head_rev: String::from("after"),
         };
 
         let report = analyze_revision_plugin::<Snapshot, _, _, _, _, _>(
             &ctx,
             helper_inputs,
-            |_, _| Err(String::from("boom")),
+            |_| Err(String::from("boom")),
             |_, reason| {
                 PluginAnalysis::new(
                     Confidence::Medium,

@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,8 +49,9 @@ impl AnalyzerPlugin for GoPlugin {
             RevisionHelperFallback {
                 kind: ReasonKind::GoAnalysisFallback,
                 input_kind_reason: "go plugin requires git revision input",
-                before_workspace_reason: "go plugin requires before workspace",
-                after_workspace_reason: "go plugin requires after workspace",
+                repo_root_reason: "go plugin requires repo root",
+                base_rev_reason: "go plugin requires base revision",
+                head_rev_reason: "go plugin requires head revision",
                 required_files_reason: "go plugin requires go.mod",
             },
             fallback_enrich,
@@ -85,12 +83,20 @@ fn fallback_findings(ctx: &AnalysisContext, reason: &str) -> PluginAnalysis {
 
 #[derive(Serialize)]
 struct HelperRequest {
-    workspace_root: String,
+    repo_root: String,
+    base_rev: String,
+    head_rev: String,
     changed_files: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct HelperResponse {
+    before: HelperRevisionSnapshot,
+    after: HelperRevisionSnapshot,
+}
+
+#[derive(Deserialize)]
+struct HelperRevisionSnapshot {
     packages: Vec<HelperPackageSnapshot>,
     files: Vec<HelperFileSnapshot>,
 }
@@ -151,25 +157,45 @@ impl RevisionSnapshotView for Snapshot {
     }
 }
 
-fn run_helper(workspace_root: &Path, changed_files: &[String]) -> Result<Snapshot, String> {
+fn run_helper(inputs: &crate::plugins::helper_process::RevisionHelperInputs) -> Result<(Snapshot, Snapshot), String> {
     let request = HelperRequest {
-        workspace_root: workspace_root.to_string_lossy().to_string(),
-        changed_files: changed_files.to_vec(),
+        repo_root: inputs.repo_root.to_string_lossy().to_string(),
+        base_rev: inputs.base_rev.clone(),
+        head_rev: inputs.head_rev.clone(),
+        changed_files: inputs.changed_files.clone(),
     };
     let response = run_embedded_json_helper::<_, HelperResponse>(&GO_HELPER, &request)?;
 
-    Ok(Snapshot {
-        packages: response
-            .packages
-            .into_iter()
-            .map(|snapshot| (snapshot.dir.clone(), snapshot))
-            .collect(),
-        files: response
-            .files
-            .into_iter()
-            .map(|snapshot| (snapshot.path.clone(), snapshot))
-            .collect(),
-    })
+    Ok((
+        Snapshot {
+            packages: response
+                .before
+                .packages
+                .into_iter()
+                .map(|snapshot| (snapshot.dir.clone(), snapshot))
+                .collect(),
+            files: response
+                .before
+                .files
+                .into_iter()
+                .map(|snapshot| (snapshot.path.clone(), snapshot))
+                .collect(),
+        },
+        Snapshot {
+            packages: response
+                .after
+                .packages
+                .into_iter()
+                .map(|snapshot| (snapshot.dir.clone(), snapshot))
+                .collect(),
+            files: response
+                .after
+                .files
+                .into_iter()
+                .map(|snapshot| (snapshot.path.clone(), snapshot))
+                .collect(),
+        },
+    ))
 }
 
 fn fallback_enrich(file: &crate::ChangedFile, findings: &mut Vec<crate::PluginFinding>) {

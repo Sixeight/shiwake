@@ -1,12 +1,30 @@
 const fs = require("fs");
 const path = require("path");
+const { execFileSync, spawnSync } = require("child_process");
 
 function main() {
   const input = fs.readFileSync(0, "utf8");
   const request = JSON.parse(input);
-  const changedFiles = (request.changed_files || []).filter(isTypeScriptFile);
-  const moduleGraph = buildModuleGraph(request.workspace_root);
+  const before = analyzeRevision(request.repo_root, request.base_rev, request.changed_files || []);
+  const after = analyzeRevision(request.repo_root, request.head_rev, request.changed_files || []);
+  const response = { before, after };
+
+  process.stdout.write(JSON.stringify(response));
+}
+
+function analyzeRevision(repoRoot, rev, changedPaths) {
+  const changedFiles = changedPaths.filter(isTypeScriptFile);
+  const reader = createRevisionReader(repoRoot, rev);
   const dirs = [...new Set(changedFiles.map((file) => normalizeDir(path.posix.dirname(file))))].sort();
+  const seedFiles = new Set(changedFiles);
+
+  for (const dir of dirs) {
+    for (const file of listRevisionFilesInDir(reader, dir)) {
+      seedFiles.add(file);
+    }
+  }
+
+  const moduleGraph = buildModuleGraph(reader, [...seedFiles]);
 
   const response = {
     packages: [],
@@ -17,15 +35,15 @@ function main() {
     const changedInDir = changedFiles.filter(
       (file) => normalizeDir(path.posix.dirname(file)) === dir,
     );
-    const packageSnapshot = analyzeDirectory(request.workspace_root, dir, changedInDir, moduleGraph);
+    const packageSnapshot = analyzeDirectory(dir, changedInDir, moduleGraph);
     response.packages.push(packageSnapshot.packageSnapshot);
     response.files.push(...packageSnapshot.fileSnapshots);
   }
 
-  process.stdout.write(JSON.stringify(response));
+  return response;
 }
 
-function analyzeDirectory(workspaceRoot, dir, changedFiles, moduleGraph) {
+function analyzeDirectory(dir, changedFiles, moduleGraph) {
   const exports = {};
   const implementations = [];
 
@@ -73,19 +91,53 @@ function analyzeDirectory(workspaceRoot, dir, changedFiles, moduleGraph) {
   };
 }
 
-function buildModuleGraph(workspaceRoot) {
-  const files = walkFiles(workspaceRoot)
-    .map((absolutePath) => normalizePath(path.relative(workspaceRoot, absolutePath)))
+function createRevisionReader(repoRoot, rev) {
+  return {
+    repoRoot,
+    rev,
+    directDirFiles: new Map(),
+    fileContents: new Map(),
+  };
+}
+
+function buildModuleGraph(reader, seedFiles) {
+  const modules = new Map();
+  const queue = seedFiles
     .filter(isTypeScriptFile)
     .filter((file) => !file.includes("/node_modules/"));
 
-  const modules = new Map();
+  while (queue.length > 0) {
+    const batch = [];
+    const seenInBatch = new Set();
 
-  for (const relativePath of files) {
-    const absolutePath = path.join(workspaceRoot, relativePath);
-    const source = fs.readFileSync(absolutePath, "utf8");
-    const masked = maskSource(source);
-    modules.set(relativePath, parseModule(relativePath, source, masked));
+    while (queue.length > 0) {
+      const relativePath = queue.pop();
+      if (!relativePath || modules.has(relativePath) || seenInBatch.has(relativePath)) {
+        continue;
+      }
+      seenInBatch.add(relativePath);
+      batch.push(relativePath);
+    }
+
+    loadRevisionFiles(reader, batch);
+
+    for (const relativePath of batch) {
+      const source = reader.fileContents.get(relativePath);
+      if (source === null || source === undefined) {
+        continue;
+      }
+
+      const masked = maskSource(source);
+      const moduleInfo = parseModule(relativePath, source, masked);
+      modules.set(relativePath, moduleInfo);
+
+      for (const entry of moduleInfo.rawImports) {
+        const target = resolveImportPathFromRevision(reader, relativePath, entry.source);
+        if (target && !modules.has(target)) {
+          queue.push(target);
+        }
+      }
+    }
   }
 
   for (const moduleInfo of modules.values()) {
@@ -95,30 +147,72 @@ function buildModuleGraph(workspaceRoot) {
   return { modules };
 }
 
-function walkFiles(root) {
-  const result = [];
-  const stack = [root];
-
-  while (stack.length > 0) {
-    const current = stack.pop();
-    const entries = fs.readdirSync(current, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.name === ".git" || entry.name === "node_modules") {
-        continue;
-      }
-
-      const absolutePath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(absolutePath);
-        continue;
-      }
-      if (entry.isFile()) {
-        result.push(absolutePath);
-      }
-    }
+function loadRevisionFiles(reader, paths) {
+  const pending = [...new Set(paths)].filter((relativePath) => !reader.fileContents.has(relativePath));
+  if (pending.length === 0) {
+    return;
   }
 
-  return result;
+  const input = `${pending.map((relativePath) => `${reader.rev}:${relativePath}`).join("\n")}\n`;
+  const result = spawnSync("git", ["-C", reader.repoRoot, "cat-file", "--batch"], {
+    input,
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.toString("utf8").trim());
+  }
+
+  let offset = 0;
+  for (const relativePath of pending) {
+    const lineEnd = result.stdout.indexOf(0x0a, offset);
+    if (lineEnd === -1) {
+      throw new Error("unexpected git cat-file output");
+    }
+
+    const header = result.stdout.toString("utf8", offset, lineEnd);
+    offset = lineEnd + 1;
+
+    if (header.endsWith(" missing")) {
+      reader.fileContents.set(relativePath, null);
+      continue;
+    }
+
+    const match = header.match(/^[0-9a-f]+ \w+ (\d+)$/);
+    if (!match) {
+      throw new Error(`unexpected git cat-file header: ${header}`);
+    }
+
+    const size = Number.parseInt(match[1], 10);
+    const content = result.stdout.toString("utf8", offset, offset + size);
+    offset += size;
+    if (result.stdout[offset] === 0x0a) {
+      offset += 1;
+    }
+    reader.fileContents.set(relativePath, content);
+  }
+}
+
+function listRevisionFilesInDir(reader, dir) {
+  if (reader.directDirFiles.has(dir)) {
+    return reader.directDirFiles.get(dir);
+  }
+
+  const args = ["-C", reader.repoRoot, "ls-tree", "-r", "--name-only", reader.rev];
+  if (dir !== ".") {
+    args.push("--", dir);
+  }
+  const output = execFileSync("git", args, {
+    encoding: "utf8",
+  });
+  const files = output
+    .split("\n")
+    .map((line) => normalizePath(line.trim()))
+    .filter(Boolean)
+    .filter(isTypeScriptFile)
+    .filter((file) => !file.includes("/node_modules/"))
+    .filter((file) => normalizeDir(path.posix.dirname(file)) === dir);
+
+  reader.directDirFiles.set(dir, files);
+  return files;
 }
 
 function parseModule(modulePath, source, masked) {
@@ -221,6 +315,31 @@ function resolveImportPath(fromModulePath, specifier, modules) {
 
   for (const candidate of candidates) {
     if (modules.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function resolveImportPathFromRevision(reader, fromModulePath, specifier) {
+  if (!specifier.startsWith(".")) {
+    return null;
+  }
+
+  const baseDir = path.posix.dirname(fromModulePath);
+  const raw = normalizePath(path.posix.join(baseDir, specifier));
+  const candidates = [
+    raw,
+    `${raw}.ts`,
+    `${raw}.tsx`,
+    `${raw}/index.ts`,
+    `${raw}/index.tsx`,
+  ];
+
+  for (const candidate of candidates) {
+    const dir = normalizeDir(path.posix.dirname(candidate));
+    if (listRevisionFilesInDir(reader, dir).includes(candidate)) {
       return candidate;
     }
   }
