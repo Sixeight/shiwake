@@ -180,7 +180,8 @@ fn fallback_enrich(file: &crate::ChangedFile, findings: &mut Vec<PluginFinding>)
         ));
     }
 
-    if file
+    if !is_internal_or_private_path(&file.path)
+        && file
         .added
         .iter()
         .chain(file.removed.iter())
@@ -200,6 +201,10 @@ fn analyze_package_findings(
     after: Option<&HelperPackageSnapshot>,
     findings: &mut Vec<PluginFinding>,
 ) {
+    if is_internal_or_private_path(path) {
+        return;
+    }
+
     let before_exports = before
         .map(|snapshot| snapshot.exports.clone())
         .unwrap_or_default();
@@ -453,10 +458,39 @@ fn is_exported_typescript_declaration(line: &str) -> bool {
         "export class ",
         "export interface ",
         "export type ",
-        "export const ",
     ]
     .iter()
     .any(|prefix| trimmed.starts_with(prefix))
+        || is_function_like_exported_const(trimmed)
+}
+
+fn is_function_like_exported_const(line: &str) -> bool {
+    let Some(rest) = line
+        .strip_prefix("export const ")
+        .or_else(|| line.strip_prefix("export let "))
+        .or_else(|| line.strip_prefix("export var "))
+    else {
+        return false;
+    };
+
+    rest.contains("=>")
+        || rest
+            .split_once('=')
+            .map(|(_, value)| {
+                let value = value.trim();
+                value.starts_with("function")
+                    || value.starts_with("async function")
+                    || value.starts_with("class")
+            })
+            .unwrap_or(false)
+}
+
+fn is_internal_or_private_path(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        segment == "internal"
+            || segment == "(private)"
+            || (segment.starts_with('_') && segment.len() > 1)
+    })
 }
 
 fn is_async_signal(line: &str) -> bool {

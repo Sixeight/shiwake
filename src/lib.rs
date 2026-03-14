@@ -1462,6 +1462,10 @@ fn is_import_only(file: &ChangedFile) -> bool {
 }
 
 fn has_public_interface_change(file: &ChangedFile) -> bool {
+    if is_internal_or_private_path(&file.path) {
+        return false;
+    }
+
     changed_lines(file)
         .iter()
         .any(|line| is_public_signature_line(line))
@@ -1470,7 +1474,7 @@ fn has_public_interface_change(file: &ChangedFile) -> bool {
 fn is_public_signature_line(line: &str) -> bool {
     let trimmed = line.trim();
 
-    if trimmed.starts_with("pub ") || trimmed.starts_with("export ") {
+    if trimmed.starts_with("pub ") || is_public_export_signature_line(trimmed) {
         return true;
     }
 
@@ -1484,11 +1488,66 @@ fn is_public_signature_line(line: &str) -> bool {
     false
 }
 
+fn is_public_export_signature_line(line: &str) -> bool {
+    [
+        "export function ",
+        "export async function ",
+        "export class ",
+        "export interface ",
+        "export type ",
+        "export enum ",
+        "export default function ",
+        "export default async function ",
+        "export default class ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+        || is_function_like_exported_const(line)
+}
+
+fn is_function_like_exported_const(line: &str) -> bool {
+    let Some(rest) = line
+        .strip_prefix("export const ")
+        .or_else(|| line.strip_prefix("export let "))
+        .or_else(|| line.strip_prefix("export var "))
+    else {
+        return false;
+    };
+
+    rest.contains("=>")
+        || rest
+            .split_once('=')
+            .map(|(_, value)| {
+                let value = value.trim();
+                value.starts_with("function")
+                    || value.starts_with("async function")
+                    || value.starts_with("class")
+            })
+            .unwrap_or(false)
+}
+
+fn is_internal_or_private_path(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        segment == "internal"
+            || segment == "(private)"
+            || (segment.starts_with('_') && segment.len() > 1)
+    })
+}
+
 fn control_flow_weight(file: &ChangedFile, config: &ScoreConfig) -> Option<u32> {
     let has_control_flow = changed_lines(file).iter().any(|line| {
         let trimmed = line.trim();
         [
-            "if ", "if(", "else if", "match ", "switch ", "for ", "while ", "return ", "throw ",
+            "if ",
+            "if(",
+            "else if",
+            "match ",
+            "switch ",
+            "for ",
+            "while ",
+            "throw ",
+            "break",
+            "continue",
         ]
         .iter()
         .any(|keyword| trimmed.starts_with(keyword))
@@ -1500,9 +1559,7 @@ fn control_flow_weight(file: &ChangedFile, config: &ScoreConfig) -> Option<u32> 
     let base_weight = config.score_for(&ReasonKind::ControlFlowChange);
     let is_heavy = changed_lines(file).iter().any(|line| {
         let trimmed = line.trim();
-        trimmed == "return"
-            || trimmed.starts_with("return ")
-            || trimmed.starts_with("throw ")
+        trimmed.starts_with("throw ")
             || trimmed.starts_with("for ")
             || trimmed.starts_with("while ")
             || trimmed.starts_with("match ")
@@ -1698,10 +1755,15 @@ fn change_size_weight(file: &ChangedFile, config: &ScoreConfig) -> Option<u32> {
         .as_deref()
         .or(file.before_source.as_deref())
         .map(|source| changed_lines as f64 / source.lines().count().max(1) as f64);
+    let ratio_can_raise_to_high = changed_lines >= 6;
 
-    let mut score: u32 = if changed_lines >= 25 || changed_ratio.is_some_and(|ratio| ratio >= 0.6) {
+    let mut score: u32 = if changed_lines >= 25
+        || (ratio_can_raise_to_high && changed_ratio.is_some_and(|ratio| ratio >= 0.6))
+    {
         12
-    } else if changed_lines >= 10 || changed_ratio.is_some_and(|ratio| ratio >= 0.3) {
+    } else if changed_lines >= 10
+        || (ratio_can_raise_to_high && changed_ratio.is_some_and(|ratio| ratio >= 0.3))
+    {
         8
     } else if changed_lines >= 4 {
         4

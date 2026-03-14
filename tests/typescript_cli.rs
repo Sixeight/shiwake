@@ -6,6 +6,7 @@ use std::{
 };
 
 use assert_cmd::Command;
+use serde_json::Value;
 
 fn unique_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -176,6 +177,166 @@ fn typescript_plugin_detects_async_change_from_revision_range() {
 
     assert!(
         output.contains("\"kind\":\"typescript_async_change\""),
+        "stdout was {output}"
+    );
+}
+
+#[test]
+fn typescript_plugin_ignores_exported_const_value_changes_from_revision_range() {
+    let initial = r#"const CALLER_TYPES = {
+  dispatch: "dispatch",
+}
+"#;
+    let updated = r#"export const CALLER_TYPES = {
+  dispatch: "dispatch",
+}
+"#;
+    let (repo, base, head) = init_typescript_repo(
+        "ts-exported-const-value",
+        &[("src/caller.ts", initial)],
+        &[("src/caller.ts", updated)],
+    );
+
+    let assert = Command::cargo_bin("shiwake")
+        .expect("binary should build")
+        .args([
+            "--repo",
+            repo.to_str().expect("repo path should be utf8"),
+            "--base",
+            &base,
+            "--head",
+            &head,
+            "--plugin",
+            "ts",
+        ])
+        .assert();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+    let report: Value = serde_json::from_str(&output).expect("stdout should be json");
+    let reasons = report["reasons"]
+        .as_array()
+        .expect("reasons should be an array");
+
+    assert!(
+        !reasons.iter().any(|reason| {
+            reason["kind"] == "typescript_exported_api_change"
+        }),
+        "stdout was {output}"
+    );
+}
+
+#[test]
+fn private_typescript_exports_do_not_trigger_exported_api_signals() {
+    let initial = r#"export function buildCaller(id: string): string {
+  return id
+}
+"#;
+    let updated = r#"export function buildCaller(id: string, strict: boolean): string {
+  return strict ? id.trim() : id
+}
+"#;
+    let path = "web/app/unkan-web/src/app/(private)/(ship)/dispatch-room/_constants/caller.ts";
+    let (repo, base, head) =
+        init_typescript_repo("ts-private-export", &[(path, initial)], &[(path, updated)]);
+
+    let assert = Command::cargo_bin("shiwake")
+        .expect("binary should build")
+        .args([
+            "--repo",
+            repo.to_str().expect("repo path should be utf8"),
+            "--base",
+            &base,
+            "--head",
+            &head,
+            "--plugin",
+            "ts",
+        ])
+        .assert();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+    let report: Value = serde_json::from_str(&output).expect("stdout should be json");
+    let reasons = report["reasons"]
+        .as_array()
+        .expect("reasons should be an array");
+
+    assert!(
+        !reasons.iter().any(|reason| {
+            reason["kind"] == "public_interface_change"
+                || reason["kind"] == "typescript_exported_api_change"
+        }),
+        "stdout was {output}"
+    );
+}
+
+#[test]
+fn tiny_revision_range_change_does_not_get_ratio_only_size_bump() {
+    let initial = "const status = oldStatus\n";
+    let updated = "const status = newStatus\n";
+    let (repo, base, head) = init_typescript_repo(
+        "ts-tiny-size",
+        &[("src/caller.ts", initial)],
+        &[("src/caller.ts", updated)],
+    );
+
+    let assert = Command::cargo_bin("shiwake")
+        .expect("binary should build")
+        .args([
+            "--repo",
+            repo.to_str().expect("repo path should be utf8"),
+            "--base",
+            &base,
+            "--head",
+            &head,
+        ])
+        .assert();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+    let report: Value = serde_json::from_str(&output).expect("stdout should be json");
+    let reasons = report["reasons"]
+        .as_array()
+        .expect("reasons should be an array");
+
+    assert!(
+        !reasons
+            .iter()
+            .any(|reason| reason["kind"] == "change_size"),
+        "stdout was {output}"
+    );
+}
+
+#[test]
+fn two_line_revision_range_change_does_not_get_large_ratio_size_bump() {
+    let initial = "const first = oldValue\nconst second = stableValue\n";
+    let updated = "const first = newValue\nconst second = stableValue\n";
+    let (repo, base, head) = init_typescript_repo(
+        "ts-two-line-size",
+        &[("src/caller.ts", initial)],
+        &[("src/caller.ts", updated)],
+    );
+
+    let assert = Command::cargo_bin("shiwake")
+        .expect("binary should build")
+        .args([
+            "--repo",
+            repo.to_str().expect("repo path should be utf8"),
+            "--base",
+            &base,
+            "--head",
+            &head,
+        ])
+        .assert();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+    let report: Value = serde_json::from_str(&output).expect("stdout should be json");
+    let reasons = report["reasons"]
+        .as_array()
+        .expect("reasons should be an array");
+    let size_reason = reasons
+        .iter()
+        .find(|reason| reason["kind"] == "change_size");
+
+    assert!(
+        size_reason.is_none(),
         "stdout was {output}"
     );
 }

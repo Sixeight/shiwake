@@ -235,7 +235,6 @@ function collectExportedDeclarations(source, masked) {
     /export\s+(?:default\s+)?class\s+([A-Za-z_$][\w$]*)[^{]*\{/g,
     /export\s+interface\s+([A-Za-z_$][\w$]*)[^{]*\{/g,
     /export\s+type\s+([A-Za-z_$][\w$]*)\s*=/g,
-    /export\s+const\s+([A-Za-z_$][\w$]*)\s*=/g,
   ];
 
   for (const pattern of declarations) {
@@ -268,7 +267,40 @@ function collectExportedDeclarations(source, masked) {
     }
   }
 
+  const constPattern = /export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[:=]/g;
+  let match;
+  while ((match = constPattern.exec(masked)) !== null) {
+    const [statement, name] = match;
+    const start = match.index;
+    const end = findStatementEnd(masked, start + statement.length);
+    const declaration = normalizeSignature(source.slice(start, end).trim());
+    if (!shouldTrackExportedConstDeclaration(declaration)) {
+      constPattern.lastIndex = Math.max(constPattern.lastIndex, end);
+      continue;
+    }
+    exports[name] = declaration;
+    constPattern.lastIndex = Math.max(constPattern.lastIndex, end);
+  }
+
   return exports;
+}
+
+function shouldTrackExportedConstDeclaration(declaration) {
+  if (!/\bexport\s+(?:const|let|var)\b/.test(declaration)) {
+    return false;
+  }
+
+  const [left, right = ""] = declaration.split("=", 2);
+  const initializer = right.trim().replace(/;$/, "");
+
+  return (
+    declaration.includes("=>") ||
+    /\bnew\s+class\b/.test(initializer) ||
+    initializer.startsWith("function") ||
+    initializer.startsWith("async function") ||
+    initializer.startsWith("class") ||
+    /\)\s*=>/.test(left)
+  );
 }
 
 function collectInterfaces(source, masked) {
