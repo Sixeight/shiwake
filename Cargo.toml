@@ -2,6 +2,11 @@
 name = "shiwake"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Score code diffs and emit machine-readable JSON review signals"
+readme = "README.md"
+keywords = ["git", "diff", "review", "scoring", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 path = "src/lib.rs"
