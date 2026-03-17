@@ -225,6 +225,28 @@ fn rename_like_change_stays_low() {
 }
 
 #[test]
+fn public_function_rename_like_change_stays_low() {
+    let patch = single_file_patch(
+        "src/lib.rs",
+        "src/lib.rs",
+        &["pub fn score(diff: &str) -> i32 {"],
+        &["pub fn compute_score(diff: &str) -> i32 {"],
+    );
+
+    let report = analyze_patch(&patch, &[]).expect("analysis should succeed");
+
+    assert!(report.score <= 25, "score was {}", report.score);
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == ReasonKind::RefactorLikeChange),
+        "reasons were {:?}",
+        report.reasons
+    );
+}
+
+#[test]
 fn larger_patch_scores_higher_than_small_patch() {
     let small_patch = single_file_patch(
         "src/lib.rs",

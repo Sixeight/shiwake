@@ -1021,15 +1021,28 @@ fn detect_base_scoring(
     }
 
     if !file.is_test_file() && has_public_interface_change(file) {
-        let rule_score = config.score_for(&ReasonKind::PublicInterfaceChange);
+        let public_interface_score = config.score_for(&ReasonKind::PublicInterfaceChange);
+        let rule_score = if refactor_like {
+            config.score_for(&ReasonKind::RefactorLikeChange)
+        } else {
+            public_interface_score
+        };
         base_score = base_score.max(rule_score);
-        has_semantic_risk = true;
+        has_semantic_risk = !refactor_like;
         feature_vector.public_signature_changes += 1;
-        reasons.push(ReasonKind::PublicInterfaceChange.as_reason(
-            file.path.clone(),
-            rule_score,
-            "public interface changed",
-        ));
+        reasons.push(if refactor_like {
+            ReasonKind::RefactorLikeChange.as_reason(
+                file.path.clone(),
+                rule_score,
+                "public interface rename-like change",
+            )
+        } else {
+            ReasonKind::PublicInterfaceChange.as_reason(
+                file.path.clone(),
+                rule_score,
+                "public interface changed",
+            )
+        });
     }
 
     if let Some(control_flow_score) = control_flow_weight(file, config) {
